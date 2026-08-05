@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+from marsdog_vision_interaction.utils.ros_entrypoint import run_ros_entrypoint
+
+if __name__ == "__main__":
+    run_ros_entrypoint("marsdog_vision_interaction.main")

@@ -1,0 +1,62 @@
+logging:
+  level: INFO
+  dir: log
+
+storage:
+  root: /home/cat/xbb/MarsDogVisionInteraction/data
+
+topics:
+  camera_image: /camera/camera/color/image_raw
+  visual_event: /perception/visual_event
+  enrollment_event: /perception/vision/enrollment_event
+  vision_task: /perception/vision/task
+  observation_rate_hz: 10.0
+
+providers:
+  vision:
+    type: observation
+    enabled: true
+    config:
+      face_detect_model: /home/cat/xbb/models/vision/face_detection_yunet_2023mar.onnx
+      mediapipe_model: /home/cat/xbb/models/vision/pose_landmarker_lite.task
+      hand_landmark_model: /home/cat/xbb/models/vision/hand_landmarker.task
+      face_recogn_model: /home/cat/xbb/models/vision/face_recognition_sface_2021dec.onnx
+      det_threshold: 0.3
+      nms_threshold: 0.45
+      face_input_size: [320, 320]
+      # RealSense publishes a regular 640x480 color frame.
+      stereo_enabled: false
+      stereo_view: left
+      # Only split frames wide enough to contain two horizontal eyes.
+      # A negotiated 424x240 mono profile is therefore kept at 424x240.
+      stereo_min_aspect_ratio: 2.2
+      single_target_mode: true
+      face_tracking:
+        use_bytetrack: true
+        track_activation_threshold: 0.25
+        lost_track_buffer: 30
+        minimum_matching_threshold: 0.8
+        minimum_consecutive_frames: 2
+      face_recognition_throttle:
+        min_face_score: 0.85
+        min_face_size_px: 40
+        unknown_active_retry_sec: 0.5
+        unknown_inactive_retry_sec: 1.5
+        known_active_reverify_sec: 3.0
+        known_inactive_reverify_sec: 8.0
+        confirm_known_count: 2
+        confirm_unknown_count: 4
+        sface_cosine_threshold: 0.36
+  object:
+    type: object_detector
+    enabled: true
+    config:
+      object_rknn_model: /home/cat/xbb/models/vision/yoloe-26s-seg_rknn_model
+      det_threshold: 0.6
+      nms_threshold: 0.45
+  face_recognition:
+    type: sface
+    enabled: true
+    config:
+      face_recogn_model: /home/cat/xbb/models/vision/face_recognition_sface_2021dec.onnx
+      match_threshold: 0.5

@@ -1,0 +1,10 @@
+string task_id
+string task_type
+string params_json
+---
+bool success
+string task_id
+string task_type
+string result_json
+string error_message
+float64 latency_ms

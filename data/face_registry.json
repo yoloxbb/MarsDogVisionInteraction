@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "faces": {
+    "xbb": {
+      "paths": [
+        "/home/cat/xbb/MarsDogVisionInteraction/data/faces/xbb/001.jpg",
+        "/home/cat/xbb/MarsDogVisionInteraction/data/faces/xbb/002.jpg",
+        "/home/cat/xbb/MarsDogVisionInteraction/data/faces/xbb/003.jpg"
+      ],
+      "migrated_from": "MarsDogPro"
+    }
+  }
+}

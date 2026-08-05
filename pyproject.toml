@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "marsdog-vision-interaction"
+version = "0.1.0"
+description = "Independent MarsDog camera and visual interaction ROS2 node"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+license = "Apache-2.0"
+maintainers = [
+  { name = "MarsDog Vision Team", email = "noreply@marsdog.dev" },
+]
+dependencies = [
+  "numpy>=1.26,<2",
+  "opencv-contrib-python>=4.10,<5",
+  "pyyaml>=6,<7",
+]
+
+[project.optional-dependencies]
+models = [
+  "mediapipe==0.10.18",
+  "supervision>=0.29,<0.30",
+]
+dev = [
+  "pytest>=8,<9",
+]
+
+[project.scripts]
+marsdog-vision-interaction = "marsdog_vision_interaction.main:main"
+marsdog-camera-driver = "marsdog_vision_interaction.nodes.camera_driver_node:main"
+marsdog-vision-viewer = "marsdog_vision_interaction.nodes.vision_debug_viewer_node:main"
+
+[tool.setuptools.packages.find]
+include = ["marsdog_vision_interaction*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

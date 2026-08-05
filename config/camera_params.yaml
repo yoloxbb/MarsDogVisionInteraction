@@ -1,0 +1,13 @@
+# Camera driver parameters
+# Usage: uv run camera-driver --ros-args --params-file config/camera_params.yaml
+
+camera_driver:
+  ros__parameters:
+    device: "/dev/video4"
+    width: 640
+    # This binocular camera exposes both 320x240 eyes in one 640x240 frame.
+    height: 240
+    fps: 15
+    frame_id: "camera_link"
+    image_topic: "/camera/image_raw"
+    camera_info_topic: "/camera/camera_info"

@@ -1,0 +1,133 @@
+archive:
+  name: marsdog_multi_project_contract
+  version: 1.0.0
+  baseline_date: "2026-08-04"
+  json_encoding: UTF-8
+
+nodes:
+  voice:
+    node_name: voice_interaction
+    repository: /home/cat/xbb/MarsDogVoiceInteraction
+  vision:
+    node_name: vision_interaction
+    repository: /home/cat/xbb/MarsDogVisionInteraction
+  behavior_tree:
+    node_name: behavior_tree_node
+    repository: /home/cat/xbb/20260702_MarsDogTree
+  action_executor:
+    node_name: action_executor_node
+    repository: /home/cat/xbb/20260707_MarsDogAction
+
+topics:
+  /perception/audio_event:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: 1
+    publisher: voice
+    subscribers: [behavior_tree]
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /perception/voice/enrollment_event:
+    type: std_msgs/msg/String
+    payload: json
+    publisher: voice
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /camera/camera/color/image_raw:
+    type: sensor_msgs/msg/Image
+    publisher: realsense2_camera
+    subscribers: [vision]
+    qos: {reliability: best_effort, history: keep_last, depth: 1}
+  /camera/camera/color/camera_info:
+    type: sensor_msgs/msg/CameraInfo
+    publisher: realsense2_camera
+    qos: {reliability: best_effort, history: keep_last, depth: 1}
+  /perception/visual_event:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: 1
+    publisher: vision
+    subscribers: [behavior_tree, action_executor]
+    qos: {reliability: best_effort, history: keep_last, depth: 5}
+  /perception/vision/enrollment_event:
+    type: std_msgs/msg/String
+    payload: json
+    publisher: vision
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /emotion/state:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: "2.0"
+    publisher: emotion
+    subscribers: [behavior_tree]
+    qos: {reliability: best_effort, history: keep_last, depth: 5}
+  /emotion/signal_event:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: "2.0"
+    publisher: emotion
+    subscribers: [behavior_tree]
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /internal_need/state:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: "2.0"
+    publisher: internal_need
+    subscribers: [behavior_tree]
+    qos: {reliability: best_effort, history: keep_last, depth: 5}
+  /internal_need/signal_event:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: "2.0"
+    publisher: internal_need
+    subscribers: [behavior_tree]
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /behavior/attention_tracking:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: 1
+    publisher: behavior_tree
+    subscribers: [action_executor]
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /behavior/result_event:
+    type: std_msgs/msg/String
+    payload: json
+    publisher: behavior_tree
+    subscribers: [internal_need]
+    qos: {reliability: reliable, history: keep_last, depth: 10}
+  /cmd_vel:
+    type: geometry_msgs/msg/Twist
+    publisher: action_executor
+    subscribers: [agv_base]
+    qos: {history: keep_last, depth: 10}
+
+services:
+  /perception/voice/task:
+    type: marsdog_voice_interaction/srv/VoiceTask
+    server: voice
+  /perception/vision/task:
+    type: marsdog_vision_interaction/srv/VisionTask
+    server: vision
+
+actions:
+  /execute_behavior:
+    type: marsdog_interfaces/action/ExecuteBehavior
+    server: action_executor
+    clients: [behavior_tree]
+    authoritative_definition: /home/cat/xbb/marsdog_interfaces/action/ExecuteBehavior.action
+  /spin:
+    type: nav2_msgs/action/Spin
+    server: nav2
+    clients: [action_executor]
+    optional: true
+  /navigate_to_pose:
+    type: nav2_msgs/action/NavigateToPose
+    server: nav2
+    clients: [action_executor]
+    optional: true
+
+invariants:
+  priority_order: "0 is highest; 6 is lowest"
+  visual_coordinates: "normalized [0,1] relative to selected inference view"
+  follow_lifetime: "from wake session enable until matching idle state event"
+  visual_fail_safe_timeout_sec: 0.8
+  result_event_publisher: behavior_tree
+  execute_behavior_definition_owner: marsdog_interfaces
