@@ -1,9 +1,53 @@
+# Local Python environments and caches
 .venv/
-build/
-dist/
-install/
-log/
+venv/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ROS 2 / Python build outputs
+build/
+dist/
+install/
+log/
+*.log
+
+# Runtime-generated biometric data (never commit real face samples)
+data/face_registry.json
+data/faces/
+
+# Large inference models live outside this repository
+models/
+*.onnx
+*.rknn
+*.task
+*.tflite
+
+# Machine-local configuration and secrets
+.env
+.env.*
+!.env.example
+config/*.local.yaml
+config/*.local.yml
+
+# ROS bags, captures, and debug recordings
+rosbag2_*/
+*.bag
+*.db3
+*.mcap
+captures/
+recordings/
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~

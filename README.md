@@ -12,8 +12,9 @@
 - uv
 - ROS2 Humble
 
-推理模型继续统一放在 `/home/cat/xbb/models/vision`，避免在多个项目中复制大文件；
-项目自己的配置、人脸注册表和人脸样本已随视觉项目迁移。
+推理模型继续统一放在 `/home/cat/xbb/models/vision`，避免在多个项目中复制大文件。
+人脸注册表和人脸样本是运行时生成的生物识别数据，仅保存在本机 `data/`
+目录，不进入 Git，也不打进源码发布包；新设备需单独完成人脸注册或安全迁移数据。
 
 ```bash
 cd /home/cat/xbb/MarsDogVisionInteraction
