@@ -3,24 +3,77 @@ logging:
   dir: log
 
 storage:
-  root: /home/cat/xbb/MarsDogVisionInteraction/data
+  root: ${MARSDOG_VISION_DATA_DIR}
+
+# Sample-level face CRUD API and OpenAPI UI. Authentication is temporarily
+# disabled; bind to a trusted LAN only.
+face_api:
+  enabled: true
+  host: 127.0.0.1
+  port: 8092
+  max_upload_mb: 10
 
 topics:
   camera_image: /camera/camera/color/image_raw
   visual_event: /perception/visual_event
+  object_detections: /perception/vision/object_detections
+  gesture_debug: /perception/vision/gesture_debug
   enrollment_event: /perception/vision/enrollment_event
   vision_task: /perception/vision/task
   observation_rate_hz: 10.0
+  # Stop publishing cached scene facts if the external camera stream stalls.
+  camera_stale_timeout_sec: 0.5
+  # Latest successful periodic/Service detections are mirrored briefly.
+  object_cache_timeout_sec: 2.0
+
+# Aligned RealSense depth is the only source allowed to populate a target
+# range. Missing/stale depth, invalid CameraInfo, a timestamp mismatch or an
+# unsupported encoding leaves range_valid=false and therefore forbids motion.
+depth_fusion:
+  enabled: true
+  aligned_depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+  camera_info_topic: /camera/camera/color/camera_info
+  max_sync_delta_sec: 0.10
+  stale_timeout_sec: 0.5
+  # Human inference finishes after its source colour frame. Retain a bounded,
+  # sparsely sampled depth history and choose the nearest timestamp instead of
+  # pairing the detection with whatever depth frame happens to be newest.
+  history_duration_sec: 1.5
+  history_max_frames: 30
+  history_min_interval_sec: 0.04
+  min_depth_m: 0.2
+  max_depth_m: 8.0
+  sample_radius_px: 4
+  min_valid_samples: 5
+  min_valid_fraction: 0.2
+  target_current_timeout_sec: 0.35
 
 providers:
   vision:
     type: observation
     enabled: true
     config:
-      face_detect_model: /home/cat/xbb/models/vision/face_detection_yunet_2023mar.onnx
-      mediapipe_model: /home/cat/xbb/models/vision/pose_landmarker_lite.task
-      hand_landmark_model: /home/cat/xbb/models/vision/hand_landmarker.task
-      face_recogn_model: /home/cat/xbb/models/vision/face_recognition_sface_2021dec.onnx
+      face_detect_model: ${MARSDOG_VISION_MODEL_DIR}/face_detection_yunet_2023mar.onnx
+      # Select lite/full at launch without editing the config:
+      #   ros2 launch ... pose_model_variant:=full
+      pose_model_variant: lite
+      pose_models:
+        lite: ${MARSDOG_VISION_MODEL_DIR}/pose_landmarker_lite.task
+        full: ${MARSDOG_VISION_MODEL_DIR}/pose_landmarker_full.task
+      # VIDEO mode reuses MediaPipe tracking across inferred frames. IMAGE is
+      # retained only as an explicit A/B fallback.
+      landmarker_running_mode: video
+      mediapipe_model: ${MARSDOG_VISION_MODEL_DIR}/pose_landmarker_lite.task
+      hand_landmark_model: ${MARSDOG_VISION_MODEL_DIR}/hand_landmarker.task
+      # Publish every visible person; downstream behavior policy selects the
+      # social/wake target. Five bounds CPU while covering normal group scenes.
+      max_num_poses: 5
+      horizontal_fov_deg: 69.0
+      # Probe hands on alternate inferred frames while idle. Once detected,
+      # run every inferred frame for a short hold window to preserve gestures.
+      hand_idle_inference_stride: 2
+      hand_active_hold_inferences: 8
+      face_recogn_model: ${MARSDOG_VISION_MODEL_DIR}/face_recognition_sface_2021dec.onnx
       det_threshold: 0.3
       nms_threshold: 0.45
       face_input_size: [320, 320]
@@ -30,7 +83,17 @@ providers:
       # Only split frames wide enough to contain two horizontal eyes.
       # A negotiated 424x240 mono profile is therefore kept at 424x240.
       stereo_min_aspect_ratio: 2.2
+      # Process frames 1,3,5...; at a 30 Hz camera the full face/pose/hand
+      # pipeline therefore runs at no more than about 15 Hz.
+      inference_frame_stride: 2
+      # Rolling A/B metrics published only on gesture_debug.
+      landmarker_metric_window_size: 150
       single_target_mode: true
+      action_window_size: 30
+      # Keep the armed upright baseline across the brief target loss that often
+      # happens while a person drops below the low-mounted camera's view.  This
+      # must not be shorter than FallDetectionConfig.pose_lost_reset_s (1.25 s).
+      action_track_timeout_sec: 1.5
       face_tracking:
         use_bytetrack: true
         track_activation_threshold: 0.25
@@ -51,12 +114,27 @@ providers:
     type: object_detector
     enabled: true
     config:
-      object_rknn_model: /home/cat/xbb/models/vision/yoloe-26s-seg_rknn_model
-      det_threshold: 0.6
-      nms_threshold: 0.45
+      # Ultralytics YOLOE accepts this RKNN export directory directly.
+      object_model: ${MARSDOG_VISION_MODEL_DIR}/yoloe-26s-seg_rknn_model
+      image_size: 640
+      det_threshold: 0.2
+      nms_threshold: 0.2
+      max_detections: 50
+      # Production starts with no object inference. The Action system enables
+      # a leased stream through VisionTask.set_object_detection when needed.
+      inference_rate_hz: 0.0
+      on_demand_rate_hz: 2.0
+      max_inference_rate_hz: 5.0
+      default_lease_sec: 3.0
+      max_lease_sec: 30.0
+      scheduler_rate_hz: 20.0
+      # Lightweight fact-track lifetime for query_targets; this does not start
+      # or own the detector stream.
+      target_current_timeout_sec: 0.75
+      target_persistence_sec: 2.0
   face_recognition:
     type: sface
     enabled: true
     config:
-      face_recogn_model: /home/cat/xbb/models/vision/face_recognition_sface_2021dec.onnx
+      face_recogn_model: ${MARSDOG_VISION_MODEL_DIR}/face_recognition_sface_2021dec.onnx
       match_threshold: 0.5

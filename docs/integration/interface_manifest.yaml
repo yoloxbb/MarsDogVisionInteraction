@@ -1,22 +1,22 @@
 archive:
   name: marsdog_multi_project_contract
-  version: 1.0.0
-  baseline_date: "2026-08-04"
+  version: 1.3.4
+  baseline_date: "2026-09-02"
   json_encoding: UTF-8
 
 nodes:
   voice:
     node_name: voice_interaction
-    repository: /home/cat/xbb/MarsDogVoiceInteraction
+    repository: MarsDogVoiceInteraction
   vision:
     node_name: vision_interaction
-    repository: /home/cat/xbb/MarsDogVisionInteraction
+    repository: MarsDogVisionInteraction
   behavior_tree:
     node_name: behavior_tree_node
-    repository: /home/cat/xbb/20260702_MarsDogTree
+    repository: MarsDogTree
   action_executor:
     node_name: action_executor_node
-    repository: /home/cat/xbb/20260707_MarsDogAction
+    repository: MarsDogAction
 
 topics:
   /perception/audio_event:
@@ -39,7 +39,18 @@ topics:
   /camera/camera/color/camera_info:
     type: sensor_msgs/msg/CameraInfo
     publisher: realsense2_camera
+    subscribers: [vision]
     qos: {reliability: best_effort, history: keep_last, depth: 1}
+  /camera/camera/aligned_depth_to_color/image_raw:
+    type: sensor_msgs/msg/Image
+    publisher: realsense2_camera
+    subscribers: [vision]
+    qos: {reliability: best_effort, history: keep_last, depth: 1}
+    units:
+      16UC1: millimeters
+      mono16: millimeters
+      32FC1: meters
+    failure_policy: range_valid_false
   /perception/visual_event:
     type: std_msgs/msg/String
     payload: json
@@ -47,6 +58,67 @@ topics:
     publisher: vision
     subscribers: [behavior_tree, action_executor]
     qos: {reliability: best_effort, history: keep_last, depth: 5}
+    semantics: state_snapshot
+    snapshot_identity: [vision_epoch, sequence, snapshot_id]
+    source_frame: header
+    target_contract:
+      human_candidates: all_visible_human_tracks_up_to_5
+      stable_key: [vision_epoch, target_id]
+      target_id_format: "<vision_epoch>:human:<track_id>"
+      freshness_clock: monotonic
+      metric_range:
+        required_flag: range_valid
+        distance_semantics: camera_horizontal_xz_plane_hypot_x_z_meters
+        source_field: range_source
+        valid_source: aligned_depth
+        sync_diagnostic_field: depth_sync_delta_ms
+        max_sync_delta_ms: 100
+        invalid_value: null
+        no_bbox_fallback: true
+    repeat_policy: events_may_repeat_while_the_visual_fact_remains_true
+    emitted_events:
+      EVT_VISION_MASTER:
+        condition: face_present_and_active_identity_known
+      EVT_VISION_STRANGER:
+        condition: stranger_face_present
+      EVT_VISION_MASTER_HAPPY:
+        condition: fixed_face_identity_confirmed_with_happy_compatible_action
+      EVT_VISION_MASTER_SAD:
+        condition: fixed_face_identity_confirmed_with_sad_compatible_action
+      EVT_VISION_MASTER_NEUTRAL:
+        condition: fixed_face_identity_confirmed_with_neutral_stand_sit
+      EVT_VISION_FALL:
+        condition: fixed_face_identity_confirmed_and_upright_to_lying_fall
+      EVT_VISION_STOP_GESTURE:
+        condition: fixed_face_identity_confirmed_with_stop_gesture
+      EVT_VISION_FOOD:
+        labels: [dog bowl, dog food can, dog treat bag]
+      EVT_VISION_TOY:
+        labels: [dog toy ball, dog frisbee toy, dog tug ring toy]
+    reserved_not_emitted_events:
+      - EVT_VISION_ANIMAL_CALM
+      - EVT_VISION_ANIMAL_GREET
+      - EVT_VISION_ANIMAL_PLAY
+      - EVT_VISION_ANIMAL_BOUNDARY
+  /perception/vision/object_detections:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: 2
+    publisher: vision
+    subscribers: [action_executor, vision_debug_viewer]
+    qos: {reliability: best_effort, history: keep_last, depth: 5}
+    startup_rate_hz: 0.0
+    default_on_demand_rate_hz: 2.0
+    max_rate_hz: 5.0
+    lifecycle_owner: action_executor
+  /perception/vision/gesture_debug:
+    type: std_msgs/msg/String
+    payload: json
+    schema_version: 1
+    publisher: vision
+    subscribers: [vision_debug_viewer]
+    qos: {reliability: best_effort, history: keep_last, depth: 5}
+    debug_only: true
   /perception/vision/enrollment_event:
     type: std_msgs/msg/String
     payload: json
@@ -58,7 +130,7 @@ topics:
     schema_version: "2.0"
     publisher: emotion
     subscribers: [behavior_tree]
-    qos: {reliability: best_effort, history: keep_last, depth: 5}
+    qos: {reliability: reliable, history: keep_last, depth: 10}
   /emotion/signal_event:
     type: std_msgs/msg/String
     payload: json
@@ -72,7 +144,7 @@ topics:
     schema_version: "2.0"
     publisher: internal_need
     subscribers: [behavior_tree]
-    qos: {reliability: best_effort, history: keep_last, depth: 5}
+    qos: {reliability: reliable, history: keep_last, depth: 10}
   /internal_need/signal_event:
     type: std_msgs/msg/String
     payload: json
@@ -106,13 +178,61 @@ services:
   /perception/vision/task:
     type: marsdog_vision_interaction/srv/VisionTask
     server: vision
+    target_tasks:
+      query_targets:
+        request_target_types: [human, person, animal, object]
+        response_fields:
+          - header
+          - vision_epoch
+          - sequence
+          - snapshot_id
+          - snapshot_age_ms
+          - targets
+          - human_candidates
+          - animal_candidates
+          - object_candidates
+          - active_target
+        human_target_id_format: "<vision_epoch>:human:<track_id>"
+        object_target_id_format: "<vision_epoch>:object:<track_id>"
+        animal_labels: [cat, dog]
+        toy_labels: [dog toy ball, dog frisbee toy, dog tug ring toy]
+        does_not_start_object_stream: true
+    object_tasks:
+      detect_objects: single_frame
+      set_object_detection: leased_stream_control
+      get_object_detection_state: stream_state
+    face_tasks:
+      allowed_names: [owner, family_member_1, family_member_2, family_member_3, family_member_4]
+      max_faces: 5
+      max_samples_per_face: 5
+      stable_sample_id_range: [1, 5]
+      sample_crud: [list_face_records, list_face_samples, get_face_sample, replace_face_sample, delete_face_sample]
+
+http_apis:
+  vision_face_samples:
+    default_address: http://127.0.0.1:8092
+    openapi: /docs
+    authentication: none_temporary
+    remote_bind_requires_trusted_lan: true
+    allowed_names: [owner, family_member_1, family_member_2, family_member_3, family_member_4]
+    max_faces: 5
+    max_samples_per_face: 5
+    sample_id_range: [1, 5]
+    endpoints:
+      add: POST /api/v1/faces/{name}/samples
+      list_faces: GET /api/v1/faces
+      list_samples: GET /api/v1/faces/{name}/samples
+      get_sample: GET /api/v1/faces/{name}/samples/{sample_id}
+      get_image: GET /api/v1/faces/{name}/samples/{sample_id}/image
+      replace_sample: PUT /api/v1/faces/{name}/samples/{sample_id}
+      delete_sample: DELETE /api/v1/faces/{name}/samples/{sample_id}
 
 actions:
   /execute_behavior:
     type: marsdog_interfaces/action/ExecuteBehavior
     server: action_executor
     clients: [behavior_tree]
-    authoritative_definition: /home/cat/xbb/marsdog_interfaces/action/ExecuteBehavior.action
+    authoritative_definition: marsdog_interfaces/action/ExecuteBehavior.action
   /spin:
     type: nav2_msgs/action/Spin
     server: nav2
@@ -129,5 +249,16 @@ invariants:
   visual_coordinates: "normalized [0,1] relative to selected inference view"
   follow_lifetime: "from wake session enable until matching idle state event"
   visual_fail_safe_timeout_sec: 0.8
+  vision_camera_stale_timeout_sec: 0.5
+  vision_inference_frame_stride: 2
+  vision_object_startup_rate_hz: 0.0
+  vision_object_default_on_demand_rate_hz: 2.0
+  vision_object_stream_owner: action_executor
+  vision_stranger_event_policy: generic_evt_vision_stranger_only
+  stranger_emotion_fusion_owner: behavior_tree
+  vision_does_not_subscribe_emotion_state: true
+  vision_does_not_subscribe_internal_need_state: true
+  vision_mock_policy: "synthetic observations only when provider type is explicitly mock"
+  fall_event_policy: "upright baseline plus rapid transition plus persistent lying"
   result_event_publisher: behavior_tree
   execute_behavior_definition_owner: marsdog_interfaces

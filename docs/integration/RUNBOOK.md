@@ -2,11 +2,13 @@
 
 ## 1. 联调前提
 
-所有终端先确保：
+所有终端先按本机安装方式加载 ROS2 环境，并设置可移植的工作区/仓库变量：
 
 ```bash
-source /opt/ros/humble/setup.bash
 export ROS_DOMAIN_ID=0
+export ROS2_WS="${ROS2_WS:-$HOME/ros2_ws}"
+export VISION_REPO="${VISION_REPO:-$ROS2_WS/src/MarsDogVisionInteraction}"
+export VOICE_REPO="${VOICE_REPO:-$ROS2_WS/src/MarsDogVoiceInteraction}"
 ```
 
 多机部署时，各主机的 `ROS_DOMAIN_ID`、RMW 实现和网络发现策略必须一致。先用 `ros2 node list` 确认主机间可发现，再排查业务代码。
@@ -14,7 +16,7 @@ export ROS_DOMAIN_ID=0
 公共 Action 类型必须先构建：
 
 ```bash
-cd /home/cat/ros2_ws
+cd "$ROS2_WS"
 colcon build --symlink-install --packages-select marsdog_interfaces
 source install/setup.bash
 ```
@@ -28,9 +30,8 @@ source install/setup.bash
 当前使用 RealSense，输出 640×480@30 彩色流并启用 IMU：
 
 ```bash
-source /opt/ros/humble/setup.bash
 ros2 launch realsense2_camera rs_launch.py \
-  enable_color:=true enable_depth:=false \
+  enable_color:=true enable_depth:=true align_depth.enable:=true \
   enable_infra1:=false enable_infra2:=false \
   enable_gyro:=true enable_accel:=true unite_imu_method:=2 \
   enable_sync:=true rgb_camera.color_profile:=640x480x30 \
@@ -43,6 +44,7 @@ ros2 launch realsense2_camera rs_launch.py \
 ros2 topic hz /camera/camera/color/image_raw
 ros2 topic echo /camera/camera/color/image_raw --once --field width
 ros2 topic echo /camera/camera/color/image_raw --once --field height
+ros2 topic hz /camera/camera/aligned_depth_to_color/image_raw
 ```
 
 预期约 30 Hz、宽 640、高 480。
@@ -50,27 +52,51 @@ ros2 topic echo /camera/camera/color/image_raw --once --field height
 ### 2.2 视觉节点
 
 ```bash
-cd /home/cat/xbb/MarsDogVisionInteraction
-source /opt/ros/humble/setup.bash
+cd "$VISION_REPO"
 uv run marsdog-vision-interaction \
   --ros-args -p config_path:="$PWD/config/vision.yaml"
 ```
 
-期望日志包含 `5/5 models loaded`；少模型时节点仍可降级运行，但对应字段为空。
+期望日志包含 `5/5 models loaded` 和
+`Face FastAPI ready: http://127.0.0.1:8092/docs`；少模型时节点仍可降级运行，
+但对应字段为空。人脸接口固定为主人和家人1～4五个身份、每人最多5张；本机打开
+`http://127.0.0.1:8092/docs` 可做样本级新增、查询、替换、删除和图片查看。
 
-可视化：
+需要局域网管理时：
 
 ```bash
-uv run marsdog-vision-viewer --ros-args \
-  -p camera_topic:=/camera/camera/color/image_raw \
-  -p visual_topic:=/perception/visual_event
+ros2 launch marsdog_vision_interaction vision.launch.py \
+  face_api_host:=0.0.0.0
 ```
+
+当前所有人脸 CRUD 接口暂不鉴权。仅在可信隔离局域网绑定远程地址，并优先使用
+`ssh -L 8092:127.0.0.1:8092`，避免暴露生物数据管理端口。
+
+统一视觉调试（同时启动正式视觉节点和 Viewer）：
+
+```bash
+source "$ROS2_WS/install/setup.bash"
+ros2 launch marsdog_vision_interaction vision_debug.launch.py
+```
+
+不要再同时执行上面的 `vision.launch.py`。如果正式视觉节点已经由系统启动，则改为：
+
+```bash
+ros2 launch marsdog_vision_interaction vision_debug.launch.py \
+  start_vision_node:=false
+```
+
+浏览器打开 `http://127.0.0.1:8765`，确认相机和视觉事件状态均为绿色，再逐项
+核对人体骨架、姿态/动作、人脸身份和手势。物体面板通过按钮执行单次检测或
+启动/停止 `vision-debug-web` 持续 session；若 Action 已持有其他 session，页面
+不会抢占。Viewer 从 `/perception/vision/object_detections` 显示物体框。远程机器使用 SSH
+`-L 8765:127.0.0.1:8765` 转发，不建议直接
+把含人脸画面的端口暴露到局域网。
 
 ### 2.3 语音节点
 
 ```bash
-cd /home/cat/xbb/MarsDogVoiceInteraction
-source /opt/ros/humble/setup.bash
+cd "$VOICE_REPO"
 uv run marsdog-voice-interaction \
   --ros-args -p config_path:="$PWD/config/voice.yaml"
 ```
@@ -86,8 +112,7 @@ ros2 topic echo /perception/audio_event
 先构建并 source `marsdog_interfaces` 和动作包，再启用 AGV：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/cat/ros2_ws/install/setup.bash
+source "$ROS2_WS/install/setup.bash"
 ros2 launch marsdog_action_executor action_executor.launch.py \
   agv_enabled:=true \
   attention_tracking_enabled:=true
@@ -106,8 +131,7 @@ navigation_enabled:=true
 动作 Action Server 可用后再启动：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/cat/ros2_ws/install/setup.bash
+source "$ROS2_WS/install/setup.bash"
 ros2 launch marsdog_behavior behavior_tree.launch.py
 ```
 
@@ -123,6 +147,7 @@ Executor: ActionClientAdapter → /execute_behavior
 ros2 node list
 ros2 topic info -v /perception/audio_event
 ros2 topic info -v /perception/visual_event
+ros2 topic info -v /emotion/state
 ros2 topic info -v /behavior/attention_tracking
 ros2 action info /execute_behavior
 ros2 service type /perception/vision/task
@@ -137,6 +162,7 @@ ros2 service type /perception/voice/task
 - `behavior_tree_node`
 - Voice → BT 的 `/perception/audio_event` 连接
 - Vision → BT/Action 的 `/perception/visual_event` 连接
+- Emotion → BT 的 `/emotion/state` 连接；Vision 不应订阅该 Topic
 - BT → Action 的 `/behavior/attention_tracking` 连接
 - `/execute_behavior` 一台 Server；不能同时启动两个动作执行器
 
@@ -148,7 +174,19 @@ ros2 service type /perception/voice/task
 ros2 topic echo /perception/visual_event --once
 ```
 
-检查 `active_target.tracking_state`、`body_center[0]`、`bbox[3]`。当前双目画面下，站在所选左目正前方时 `body_center[0]` 应接近 0.5。
+检查 `active_target.tracking_state`、`body_center[0]`、`bbox[3]`。当前 640×480
+RealSense 单目画面下，站在正前方时 `body_center[0]` 应接近 0.5。
+
+陌生人边界可同时观察：
+
+```bash
+ros2 topic echo /perception/visual_event
+ros2 node info /vision_interaction
+```
+
+未登记人脸出现时只应看到 `EVT_VISION_STRANGER`，且 Vision 的订阅列表中不得
+出现 `/emotion/state`。情绪节点启动、停止或状态变化均不得改变 Vision 的陌生人
+事件名；Behavior Tree 负责把该视觉事实与 `/emotion/state` 组合成最终行为候选。
 
 ### 4.2 视觉 Service
 
@@ -156,6 +194,29 @@ ros2 topic echo /perception/visual_event --once
 ros2 service call /perception/vision/task \
   marsdog_vision_interaction/srv/VisionTask \
   "{task_id: 'check-001', task_type: 'check_person', params_json: '{}'}"
+```
+
+物体流生命周期冒烟测试：
+
+```bash
+ros2 topic echo /perception/vision/object_detections
+
+ros2 service call /perception/vision/task \
+  marsdog_vision_interaction/srv/VisionTask \
+  "{task_id: 'object-start-001', task_type: 'set_object_detection', \
+    params_json: '{\"enabled\":true,\"session_id\":\"object-smoke-001\",\
+\"rate_hz\":2.0,\"target_labels\":[\"dog toy ball\"],\"lease_sec\":3.0}'}"
+```
+
+预期 Topic 的 `schema_version=2`、`source=stream`、
+`stream.session_id=object-smoke-001`。使用相同请求在 3 秒前续租；停止续租后预期
+收到 `status=stopped,stop_reason=lease_expired`。显式停止可调用：
+
+```bash
+ros2 service call /perception/vision/task \
+  marsdog_vision_interaction/srv/VisionTask \
+  "{task_id: 'object-stop-001', task_type: 'set_object_detection', \
+    params_json: '{\"enabled\":false,\"session_id\":\"object-smoke-001\"}'}"
 ```
 
 ### 4.3 行为 Action
@@ -221,6 +282,8 @@ Action SUCCESS(metadata_json.energyValue)
 - 无障碍物传感器/代价地图保护时，不要在狭窄环境直接运行预录制平移、前进动作。
 - 首次调参架空驱动轮或使用急停可触达的低速场地。
 - 任何目标丢失、视觉超时、会话结束、Action 取消都必须产生零速度。
+- 寻物 Action 必须只接受匹配 `session_id` 的新鲜物体结果，并在所有终态关闭
+  视觉租约；视觉节点不得发布 `/cmd_vel`。
 - 退出动作节点前先确认 `/cmd_vel` 已归零。
 - `/cmd_vel` 不得再接入第二个未仲裁的发布者；可用 `ros2 topic info -v /cmd_vel` 检查。
 
@@ -230,12 +293,18 @@ Action SUCCESS(metadata_json.energyValue)
 |---|---|
 | `service=unavailable` | `.srv` 未经过 colcon 生成，或未 source install |
 | BT 使用 Mock executor | `marsdog_interfaces` 未构建/source，或 Action Server 未启动 |
-| 视觉左右跳框 | 双目未选单眼；确认 `stereo_enabled=true`、`stereo_view=left` |
-| Viewer 显示窄图/坐标错 | 消费者仍按 640 宽解释单眼归一化坐标 |
+| 视觉左右跳框 | 检查目标 Track ID、人体关键点和相机是否被错误配置为双目 |
+| Viewer 显示窄图/坐标错 | RealSense 当前应为 `stereo_enabled=false`，完整 640×480 参与推理 |
+| Web Viewer 没有画面 | 检查 `http://127.0.0.1:8765`、相机 Topic 和页面中的相机消息年龄 |
+| Web Viewer 没有物体框 | 正式配置默认关闭；先检查 Action 是否成功开启/续租 `set_object_detection`，再检查 session、Topic、相机和 RKNN 模型 |
 | 唤醒后不转向 | `/behavior/attention_tracking`、Nav2 `/spin`、wake frame/角度方向 |
 | 跟随只前进一小段 | `follow_owner` 被配置成固定 Twist 动作；正式配置应为 handoff |
 | 跟随不前进 | 目标过近、偏角过大、视觉过期、Action 占锁或 AGV 未启用 |
-| 左右抽搐 | 双目目标切换、目标 ID 频繁变化、死区过小或方向符号错误 |
+| 左右抽搐 | 目标 ID 频繁变化、躯干中心不稳、死区过小或方向符号错误 |
+| 相机断流仍显示人物 | 检查代码/配置是否包含 `camera_stale_timeout_sec=0.5`，目标年龄不得被发布定时器刷新 |
+| 静态躺卧触发跌倒 | 应使用时序 GesturePose 引擎；确认不是旧随机 `PoseActionClassifier` |
+| Vision 出现陌生人 Alert/Friend 细分事件 | 运行的不是当前版本；Vision 应只发 `EVT_VISION_STRANGER` 且不订阅 `/emotion/state` |
+| 陌生人行为未结合情绪或重复/冲突 | 检查 BT 对 `EVT_VISION_STRANGER` 与 `/emotion/state` 的组合逻辑，以及 10 Hz 状态流的 queued/in-flight 去重 |
 | 充电一直不结束 | Action 未返回 SUCCESS，或 Result 未携带/转换 `energyValue` |
 | 充电被情绪中断 | 运行配置/代码不是带延迟队列和抢占修复的当前版本 |
 | 情绪动作后长期静止 | 检查 `emotion_continuation` 配置和 `/emotion/state.triggered` |
@@ -246,6 +315,8 @@ Action SUCCESS(metadata_json.energyValue)
 - [ ] 所有 Topic 的类型和 QoS 与 `interface_manifest.yaml` 一致。
 - [ ] Voice 的同一会话保持相同 `interaction_id`。
 - [ ] Vision 在当前相机下只输出单个稳定目标，坐标中心定义正确。
+- [ ] Vision 空闲时无物体推理；Action 开启后按 session 发布，停止或租约到期后清空。
+- [ ] Vision 对陌生人只发 `EVT_VISION_STRANGER` 且不订阅 `/emotion/state`；组合判断在 BT 验证。
 - [ ] BT 在 Action 不可抢占时保留候选，而不是丢弃。
 - [ ] Action 只接受行为表中的精确 `behavior_name`。
 - [ ] 会话结束 1 秒内 `/cmd_vel` 归零。

@@ -59,7 +59,7 @@ class FaceRecognitionProvider(BaseProvider):
 
         self._net: Any = None  # cv2.dnn.Net
         self._loaded = False
-        self._enrolled: dict[str, np.ndarray] = {}
+        self._enrolled: dict[str, list[np.ndarray]] = {}
         self._lock = threading.Lock()
 
     @property
@@ -169,7 +169,7 @@ class FaceRecognitionProvider(BaseProvider):
             return {"success": False, "user_id": sid}
 
         with self._lock:
-            self._enrolled[sid] = embedding
+            self._enrolled.setdefault(sid, []).append(embedding)
 
         logger.info("FaceRecognition enrolled: id=%s, total=%d", sid, len(self._enrolled))
         return {"success": True, "user_id": sid}
@@ -197,11 +197,12 @@ class FaceRecognitionProvider(BaseProvider):
         best_score = 0.0
 
         with self._lock:
-            for uid, stored_emb in self._enrolled.items():
-                score = _cosine(embedding, stored_emb)
-                if score > best_score:
-                    best_score = score
-                    best_id = uid
+            for uid, templates in self._enrolled.items():
+                for stored_emb in templates:
+                    score = _cosine(embedding, stored_emb)
+                    if score > best_score:
+                        best_score = score
+                        best_id = uid
 
         matched = best_score >= self._match_threshold
 
@@ -215,3 +216,8 @@ class FaceRecognitionProvider(BaseProvider):
             "confidence": round(float(best_score), 4),
             "matched": matched,
         }
+
+    def clear_enrolled(self) -> None:
+        """Drop the in-memory registry before rebuilding it from local storage."""
+        with self._lock:
+            self._enrolled.clear()

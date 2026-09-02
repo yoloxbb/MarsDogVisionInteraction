@@ -7,6 +7,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(
   ${PROJECT_NAME}
@@ -26,6 +27,7 @@ install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/vision_interaction
   scripts/camera_driver
+  scripts/vision_debug_viewer
   DESTINATION lib/${PROJECT_NAME}
 )
 

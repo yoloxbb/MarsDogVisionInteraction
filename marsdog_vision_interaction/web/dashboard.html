@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MarsDog 视觉识别调试</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #081018;
+      --panel: rgba(16, 29, 41, .94);
+      --panel-2: #132535;
+      --line: #284154;
+      --text: #e9f4fa;
+      --muted: #87a4b5;
+      --ok: #3ee58f;
+      --warn: #ffc857;
+      --bad: #ff6577;
+      --cyan: #52d3ff;
+      --purple: #ed6cff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 0%, #14334a 0, transparent 34%),
+        radial-gradient(circle at 100% 18%, #2f173c 0, transparent 26%),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 17px 22px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(7, 15, 22, .78);
+      backdrop-filter: blur(14px);
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+    h1 { font-size: 20px; margin: 0; letter-spacing: .03em; }
+    .subtitle { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .status-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: var(--muted);
+      background: #0c1923;
+    }
+    .badge.ok { color: var(--ok); border-color: #277451; }
+    .badge.warn { color: var(--warn); border-color: #7b6533; }
+    .badge.bad { color: var(--bad); border-color: #843948; }
+    main { padding: 18px; max-width: 1800px; margin: 0 auto; }
+    .layout { display: grid; grid-template-columns: minmax(580px, 1.75fr) minmax(350px, 1fr); gap: 16px; }
+    .visual-panel { position: sticky; top: 84px; align-self: start; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow: 0 14px 44px rgba(0, 0, 0, .22);
+    }
+    .panel-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--line);
+      color: #cfe5f0;
+      font-size: 13px;
+      font-weight: 650;
+    }
+    .video-wrap { aspect-ratio: 4 / 3; background: #020506; display: grid; place-items: center; position: relative; }
+    #stream { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .legend {
+      display: flex;
+      gap: 14px;
+      flex-wrap: wrap;
+      padding: 10px 14px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .dot { width: 9px; height: 9px; display: inline-block; border-radius: 50%; margin-right: 5px; }
+    .cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
+    .metric { padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .metric .value { font-size: 25px; font-weight: 750; line-height: 1; }
+    .metric .label { color: var(--muted); font-size: 11px; margin-top: 7px; }
+    .side { display: grid; gap: 14px; align-content: start; }
+    .content { padding: 12px 14px; }
+    .kv { display: grid; grid-template-columns: 125px 1fr; gap: 7px 10px; font-size: 13px; }
+    .kv .key { color: var(--muted); }
+    .value-text { overflow-wrap: anywhere; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { color: var(--muted); font-weight: 500; text-align: left; }
+    th, td { padding: 7px 6px; border-bottom: 1px solid #203645; vertical-align: top; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .empty { color: #648091; font-size: 12px; padding: 7px 0; }
+    code { color: #b8eaff; font-family: "JetBrains Mono", Consolas, monospace; }
+    details { margin-top: 16px; }
+    summary { cursor: pointer; color: var(--muted); padding: 12px 14px; }
+    pre { margin: 0; padding: 14px; max-height: 420px; overflow: auto; background: #061019; color: #b8ccd7; font-size: 11px; }
+    .error { color: var(--bad); }
+    .hint { color: var(--muted); font-size: 11px; line-height: 1.5; padding: 0 14px 12px; }
+    .scroll-table { max-height: 360px; overflow: auto; }
+    .recognized { color: var(--ok); font-weight: 700; }
+    .form-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input, select, button {
+      border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+      background: #091721; color: var(--text); font: inherit;
+    }
+    input { flex: 1; min-width: 130px; }
+    button { cursor: pointer; }
+    button.primary { background: #0d6180; border-color: var(--cyan); }
+    button.danger { color: var(--bad); }
+    .progress { height: 8px; background: #07121a; border-radius: 9px; overflow: hidden; margin: 10px 0; }
+    .progress > i { display:block; height:100%; width:0; background:var(--ok); transition:width .2s; }
+    .face-list { display:flex; gap:7px; flex-wrap:wrap; margin-top:10px; }
+    .face-chip { border:1px solid var(--line); border-radius:999px; padding:5px 9px; font-size:12px; }
+    .event-actions { display:flex; gap:7px; flex-wrap:wrap; }
+    .event-active-list { display:flex; gap:7px; flex-wrap:wrap; padding:12px 14px 0; }
+    .event-active { color:var(--warn); border-color:#7b6533; }
+    .event-table td:nth-child(2), .event-table td:nth-child(3) { font-family:"JetBrains Mono", Consolas, monospace; }
+    .event-enter td:first-child { color:var(--ok); font-weight:700; }
+    .event-active-row td:first-child { color:var(--warn); font-weight:700; }
+    .event-exit td:first-child { color:var(--muted); font-weight:700; }
+    .event-safety-critical { border-left:3px solid var(--bad); }
+    .event-safety-stop { border-left:3px solid var(--warn); }
+    .event-history-panel { order: -10; }
+    .event-history-panel .scroll-table { max-height: min(38vh, 420px); }
+    body.object-only .non-object { display: none !important; }
+    body.object-only .cards { grid-template-columns: 1fr; }
+    body.object-only .layout { grid-template-columns: minmax(580px, 2fr) minmax(300px, .8fr); }
+    @media (max-width: 1050px) {
+      .layout { grid-template-columns: 1fr; }
+      body.object-only .layout { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: repeat(2, 1fr); }
+      .visual-panel { position: static; }
+      .event-history-panel .scroll-table { max-height: 360px; }
+    }
+    @media (max-width: 620px) {
+      header { align-items: flex-start; flex-direction: column; }
+      main { padding: 10px; }
+      .layout { display: block; }
+      .side { margin-top: 12px; }
+      .video-wrap { aspect-ratio: 4 / 3; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1 id="pageTitle">MarsDog 视觉识别调试</h1>
+      <div id="pageSubtitle" class="subtitle">相机原图 + /perception/visual_event + 物体检测 Topic</div>
+    </div>
+    <div class="status-row">
+      <span id="cameraBadge" class="badge bad">相机：等待</span>
+      <span id="visualBadge" class="badge bad non-object">视觉事件：等待</span>
+      <span id="gestureBadge" class="badge bad non-object">动作调试：等待</span>
+      <span id="objectBadge" class="badge warn">物体识别：等待</span>
+    </div>
+  </header>
+  <main>
+    <div class="cards">
+      <div class="metric non-object"><div id="humanCount" class="value">0</div><div class="label">人体</div></div>
+      <div class="metric non-object"><div id="faceCount" class="value">0</div><div class="label">人脸</div></div>
+      <div class="metric non-object"><div id="handCount" class="value">0</div><div class="label">手部</div></div>
+      <div class="metric"><div id="objectCount" class="value">0</div><div class="label">物体</div></div>
+    </div>
+    <div class="layout">
+      <section class="panel visual-panel">
+        <div class="panel-title"><span>实时叠加画面</span><span id="frameInfo">等待图像</span></div>
+        <div class="video-wrap"><img id="stream" src="/stream.mjpg" alt="等待相机画面"></div>
+        <div class="legend">
+          <span class="non-object"><i class="dot" style="background:#00dc00"></i>人体/姿态骨架</span>
+          <span class="non-object"><i class="dot" style="background:#00b4ff"></i>人脸</span>
+          <span><i class="dot" style="background:#ff00dc"></i>物体</span>
+          <span class="non-object"><i class="dot" style="background:#ff7814"></i>手部骨架</span>
+          <span class="non-object"><i class="dot" style="background:#ff2424"></i>ActiveTarget</span>
+        </div>
+      </section>
+      <div class="side">
+        <section class="panel non-object">
+          <div class="panel-title">在线人脸录入</div>
+          <div class="content">
+            <div class="form-row">
+              <select id="faceName">
+                <option value="owner">主人</option>
+                <option value="family_member_1">家人1</option>
+                <option value="family_member_2">家人2</option>
+                <option value="family_member_3">家人3</option>
+                <option value="family_member_4">家人4</option>
+              </select>
+              <button id="startEnrollment" class="primary">开始连续录入</button>
+              <button id="cancelEnrollment">取消</button>
+            </div>
+            <div class="progress"><i id="enrollmentBar"></i></div>
+            <div id="enrollmentStatus" class="value-text">尚未开始</div>
+            <div class="hint" style="padding:8px 0 0">固定为主人和家人1～4，共5个身份；每人最多5张。自然面对摄像头并保持稳定，当前剩余不足3张时只补满剩余槽位。</div>
+            <div class="form-row" style="margin-top:10px">
+              <button id="verifyFace">现场识别</button>
+              <button id="loadFaces">刷新名单</button>
+            </div>
+            <div id="faceList" class="face-list"></div>
+            <div id="faceActionError" class="error"></div>
+          </div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title">当前目标</div>
+          <div id="target" class="content kv"></div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title">关键点模型 A/B</div>
+          <div id="landmarker" class="content kv"></div>
+          <div class="hint">检测率需在画面中持续有人时比较；Lite/Full 应使用相同站位、动作和统计窗口。</div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title"><span>GesturePose 原始判定</span><span id="gestureTiming">—</span></div>
+          <div id="gestureSummary" class="content kv"></div>
+          <div class="hint">fast_nod 要求速度、反转和位移同时达标；clapping 要求至少两次手间距方向反转。只有时序平滑后命中的标签才显示 ✓。</div>
+          <div class="content scroll-table">
+            <table><thead><tr><th>命中</th><th>精确标签</th><th>优先级</th><th>类型</th><th>原始分</th><th>稳定分</th></tr></thead><tbody id="gestureScores"></tbody></table>
+          </div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title">人体与姿态</div>
+          <div class="content"><table><thead><tr><th>ID</th><th>姿态</th><th>动作</th><th>置信度</th></tr></thead><tbody id="humans"></tbody></table></div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title">人脸识别</div>
+          <div class="content"><table><thead><tr><th>ID</th><th>身份</th><th>状态</th><th>置信度</th></tr></thead><tbody id="faces"></tbody></table></div>
+        </section>
+        <section class="panel">
+          <div id="detectionsTitle" class="panel-title">手势与物体</div>
+          <div class="content">
+            <div class="form-row">
+              <label for="objectConfidence" class="key" style="align-self:center">物体置信度</label>
+              <input id="objectConfidence" type="number" min="0" max="1" step="0.05" value="0.5">
+              <label for="objectRate" class="key" style="align-self:center">持续频率</label>
+              <input id="objectRate" type="number" min="0.1" max="5" step="0.1" value="1.0">
+              <button id="detectObjectsOnce" class="primary">单次物体识别</button>
+              <button id="startObjectStream" class="primary">启动持续识别</button>
+              <button id="stopObjectStream" class="danger" disabled>停止持续识别</button>
+            </div>
+            <div id="objectManualStatus" class="hint" style="padding:8px 0">单次识别不创建 session；持续识别使用 vision-debug-web session，关闭页面后最多30秒自动到期。</div>
+            <table><thead><tr><th>类型</th><th>识别结果</th><th>置信度/说明</th></tr></thead><tbody id="detections"></tbody></table>
+            <div id="objectError" class="error"></div>
+          </div>
+        </section>
+        <section class="panel non-object">
+          <div class="panel-title">事件与控制</div>
+          <div id="events" class="content kv"></div>
+        </section>
+        <section class="panel non-object event-history-panel">
+          <div class="panel-title">
+            <span>Vision 已发布事件记录</span>
+            <span class="event-actions">
+              <button id="copyEventHistory">复制 JSON</button>
+              <button id="exportEventHistory">导出 JSON</button>
+              <button id="clearEventHistory" class="danger">清空</button>
+            </span>
+          </div>
+          <div id="activePublishedEvents" class="event-active-list"></div>
+          <div class="hint" style="padding-top:10px">仅证明 Vision 已在 /perception/visual_event.events[] 发布；不代表行为树已选中或 Action 已执行。ENTER/ACTIVE/EXIT 分别表示开始、持续和结束。</div>
+          <div class="content scroll-table">
+            <table class="event-table"><thead><tr><th>状态</th><th>精确事件</th><th>时间</th><th>目标/证据</th><th>Seq</th><th>重复/持续</th></tr></thead><tbody id="publishedEventHistory"></tbody></table>
+          </div>
+          <div id="eventHistoryStatus" class="hint"></div>
+        </section>
+      </div>
+    </div>
+    <details class="panel">
+      <summary id="rawSummary">查看原始 visual_event JSON</summary>
+      <pre id="raw">{}</pre>
+    </details>
+    <details class="panel non-object">
+      <summary>查看原始 GesturePose 调试 JSON</summary>
+      <pre id="gestureRaw">{}</pre>
+    </details>
+  </main>
+  <script>
+    const byId = id => document.getElementById(id);
+    const text = value => value === undefined || value === null || value === '' ? '—' : String(value);
+    const fixed = (value, digits = 2) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '—';
+    const percent = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : '—';
+    const objectDebugSession = 'vision-debug-web';
+    let latestEventExport = {active_events: [], history: []};
+    let objectLeaseTimer = null;
+    let objectControlPending = false;
+    let objectDebugDesired = false;
+    function badge(element, label, age, threshold) {
+      const valid = Number.isFinite(Number(age));
+      element.className = 'badge ' + (!valid ? 'bad' : Number(age) <= threshold ? 'ok' : 'bad');
+      element.textContent = `${label}：${valid ? Math.round(age) + ' ms' : '等待'}`;
+    }
+    function setRows(element, rows, columns) {
+      element.replaceChildren();
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = columns;
+        td.className = 'empty';
+        td.textContent = '暂无识别结果';
+        tr.append(td); element.append(tr); return;
+      }
+      rows.forEach(values => {
+        const tr = document.createElement('tr');
+        values.forEach(value => { const td = document.createElement('td'); td.textContent = text(value); tr.append(td); });
+        element.append(tr);
+      });
+    }
+    function setKv(element, entries) {
+      element.replaceChildren();
+      entries.forEach(([key, value]) => {
+        const k = document.createElement('div'); k.className = 'key'; k.textContent = key;
+        const v = document.createElement('div'); v.className = 'value-text'; v.textContent = text(value);
+        element.append(k, v);
+      });
+    }
+    function eventTime(value) {
+      const timestamp = Number(value);
+      if (!Number.isFinite(timestamp)) return '—';
+      return new Date(timestamp * 1000).toLocaleTimeString('zh-CN', {
+        hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit',
+        fractionalSecondDigits: 3,
+      });
+    }
+    function eventEvidence(value) {
+      const evidence = value || {};
+      const parts = [];
+      if (evidence.track_id !== undefined && evidence.track_id !== null) parts.push(`track=${evidence.track_id}`);
+      if (evidence.identity) parts.push(`identity=${evidence.identity}/${text(evidence.identity_state)}`);
+      const pose = evidence.pose_action_label || evidence.pose_action;
+      if (pose) parts.push(`pose=${pose}`);
+      if ((evidence.hand_actions || []).length) parts.push(`hands=${evidence.hand_actions.join('|')}`);
+      if (evidence.pose_event_gate) parts.push(`gate=${evidence.pose_event_gate}`);
+      return parts.join(' · ') || '—';
+    }
+    function showPublishedEvents(history, activeEvents) {
+      const activeHost = byId('activePublishedEvents'); activeHost.replaceChildren();
+      if (!(activeEvents || []).length) {
+        const empty = document.createElement('span'); empty.className = 'empty';
+        empty.textContent = '当前无已发布事件'; activeHost.append(empty);
+      } else {
+        activeEvents.forEach(item => {
+          const chip = document.createElement('span'); chip.className = 'badge event-active';
+          chip.textContent = `${item.event} · ×${item.repeat_count} · ${fixed(Number(item.duration_ms) / 1000, 1)}s`;
+          activeHost.append(chip);
+        });
+      }
+      const body = byId('publishedEventHistory'); body.replaceChildren();
+      const rows = [...(history || [])].reverse();
+      if (!rows.length) {
+        const tr = document.createElement('tr'), td = document.createElement('td');
+        td.colSpan = 6; td.className = 'empty'; td.textContent = '暂无已发布事件记录';
+        tr.append(td); body.append(tr); return;
+      }
+      rows.forEach(item => {
+        const tr = document.createElement('tr');
+        tr.className = item.phase === 'ENTER' ? 'event-enter' : item.phase === 'ACTIVE' ? 'event-active-row' : 'event-exit';
+        if (item.event === 'EVT_VISION_FALL') tr.classList.add('event-safety-critical');
+        if (item.event === 'EVT_VISION_STOP_GESTURE') tr.classList.add('event-safety-stop');
+        const values = [
+          item.phase, item.event, eventTime(item.received_at), eventEvidence(item.evidence),
+          `${text(item.vision_epoch)} / ${text(item.sequence)}`,
+          `×${text(item.repeat_count)} / ${fixed(Number(item.duration_ms) / 1000, 2)}s${item.reason ? ` / ${item.reason}` : ''}`,
+        ];
+        values.forEach(value => { const td = document.createElement('td'); td.textContent = value; tr.append(td); });
+        body.append(tr);
+      });
+    }
+    async function copyEventHistory() {
+      const content = JSON.stringify(latestEventExport, null, 2);
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(content);
+      } else {
+        const area = document.createElement('textarea');
+        area.value = content; area.style.position = 'fixed'; area.style.opacity = '0';
+        document.body.append(area); area.select();
+        if (!document.execCommand('copy')) throw new Error('浏览器不允许复制');
+        area.remove();
+      }
+      byId('eventHistoryStatus').textContent = '事件记录 JSON 已复制';
+    }
+    function exportEventHistory() {
+      const blob = new Blob([JSON.stringify(latestEventExport, null, 2)], {type: 'application/json'});
+      const link = document.createElement('a'); link.href = URL.createObjectURL(blob);
+      link.download = `marsdog-vision-events-${new Date().toISOString().replace(/:/g, '-')}.json`;
+      link.click(); URL.revokeObjectURL(link.href);
+      byId('eventHistoryStatus').textContent = '事件记录 JSON 已导出';
+    }
+    async function visionTask(taskType, params = {}) {
+      const response = await fetch('/api/vision/task', {
+        method: 'POST', headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({task_type: taskType, params}),
+      });
+      const result = await response.json();
+      if (!result.ok) throw new Error(result.error || '任务失败');
+      return result;
+    }
+    function objectControlValues() {
+      const confidence = Number(byId('objectConfidence').value);
+      const rateHz = Number(byId('objectRate').value);
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error('置信度必须在 0～1 之间');
+      if (!Number.isFinite(rateHz) || rateHz <= 0 || rateHz > 5) throw new Error('持续频率必须在 0～5 Hz 之间');
+      return {confidence, rate_hz: rateHz};
+    }
+    async function renewObjectDebugStream() {
+      const values = objectControlValues();
+      return visionTask('set_object_detection', {
+        enabled: true, session_id: objectDebugSession, lease_sec: 30, ...values,
+      });
+    }
+    function startObjectLeaseTimer() {
+      if (objectLeaseTimer !== null) return;
+      objectLeaseTimer = setInterval(() => {
+        renewObjectDebugStream().catch(error => {
+          clearInterval(objectLeaseTimer); objectLeaseTimer = null;
+          objectDebugDesired = false;
+          byId('objectManualStatus').textContent = `持续识别续租失败：${error.message}`;
+        });
+      }, 10000);
+    }
+    function stopObjectLeaseTimer() {
+      if (objectLeaseTimer !== null) clearInterval(objectLeaseTimer);
+      objectLeaseTimer = null;
+    }
+    const faceLabels = {
+      owner: '主人', family_member_1: '家人1', family_member_2: '家人2',
+      family_member_3: '家人3', family_member_4: '家人4',
+    };
+    let faceRecords = {};
+    function showFaces(faces) {
+      const host = byId('faceList'); host.replaceChildren();
+      faceRecords = {};
+      (faces || []).forEach(item => {
+        const record = typeof item === 'string' ? {name: item, shots: 0} : item;
+        const name = record.name;
+        faceRecords[name] = record;
+        const chip = document.createElement('span'); chip.className = 'face-chip';
+        chip.append(document.createTextNode(`${faceLabels[name] || name} (${record.shots || 0}/5) `));
+        const remove = document.createElement('button'); remove.className = 'danger';
+        remove.textContent = '删除'; remove.onclick = async () => {
+          if (!confirm(`删除 ${name} 的本地人脸数据？`)) return;
+          try { await visionTask('delete_face', {name}); await loadFaces(); }
+          catch (error) { byId('faceActionError').textContent = error.message; }
+        };
+        chip.append(remove); host.append(chip);
+      });
+    }
+    async function loadFaces() {
+      const result = await visionTask('list_face_records'); showFaces(result.faces);
+    }
+    byId('startEnrollment').onclick = async () => {
+      const name = byId('faceName').value.trim();
+      if (!name) { byId('faceActionError').textContent = '请先输入姓名'; return; }
+      try {
+        byId('faceActionError').textContent = '';
+        const shots = Number((faceRecords[name] || {}).shots || 0);
+        const remaining = Math.max(0, 5 - shots);
+        if (!remaining) throw new Error('该身份已达到5张上限，请先删除或替换样本');
+        await visionTask('start_face_enrollment', {name, required_shots: Math.min(3, remaining)});
+      } catch (error) { byId('faceActionError').textContent = error.message; }
+    };
+    byId('cancelEnrollment').onclick = async () => {
+      try { await visionTask('cancel_face_enrollment'); }
+      catch (error) { byId('faceActionError').textContent = error.message; }
+    };
+    byId('verifyFace').onclick = async () => {
+      try {
+        const result = await visionTask('recognize_face');
+        byId('faceActionError').textContent = result.matched
+          ? `识别成功：${result.user_id} (${fixed(result.confidence, 3)})`
+          : `未识别 (${fixed(result.confidence, 3)})`;
+      } catch (error) { byId('faceActionError').textContent = error.message; }
+    };
+    byId('loadFaces').onclick = () => loadFaces().catch(error => {
+      byId('faceActionError').textContent = error.message;
+    });
+    byId('detectObjectsOnce').onclick = async () => {
+      const button = byId('detectObjectsOnce');
+      const status = byId('objectManualStatus');
+      const confidence = Number(byId('objectConfidence').value);
+      if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+        status.textContent = '置信度必须在 0～1 之间'; return;
+      }
+      button.disabled = true;
+      status.textContent = '识别中；首次调用需要加载模型，可能耗时较长……';
+      try {
+        const result = await visionTask('detect_objects', {confidence});
+        const count = (result.objects || []).length;
+        status.textContent = `单次识别完成：${count} 个物体 · ${fixed(result.latency_ms, 0)} ms`;
+      } catch (error) {
+        status.textContent = `单次识别失败：${error.message}`;
+      } finally {
+        button.disabled = false;
+      }
+    };
+    byId('startObjectStream').onclick = async () => {
+      const status = byId('objectManualStatus');
+      objectControlPending = true;
+      status.textContent = '正在启动持续物体识别……';
+      try {
+        const result = await renewObjectDebugStream();
+        objectDebugDesired = true;
+        startObjectLeaseTimer();
+        status.textContent = `持续识别已启动：${fixed(result.stream.rate_hz, 1)} Hz`;
+      } catch (error) {
+        status.textContent = `启动失败：${error.message}`;
+      } finally {
+        objectControlPending = false;
+      }
+    };
+    byId('stopObjectStream').onclick = async () => {
+      const status = byId('objectManualStatus');
+      objectControlPending = true;
+      try {
+        await visionTask('set_object_detection', {
+          enabled: false, session_id: objectDebugSession,
+        });
+        objectDebugDesired = false;
+        stopObjectLeaseTimer();
+        status.textContent = '持续物体识别已停止';
+      } catch (error) {
+        status.textContent = `停止失败：${error.message}`;
+      } finally {
+        objectControlPending = false;
+      }
+    };
+    byId('copyEventHistory').onclick = () => copyEventHistory().catch(error => {
+      byId('eventHistoryStatus').textContent = `复制失败：${error.message}`;
+    });
+    byId('exportEventHistory').onclick = exportEventHistory;
+    byId('clearEventHistory').onclick = async () => {
+      if (!confirm('清空本次 Viewer 进程内的事件记录？')) return;
+      try {
+        const response = await fetch('/api/debug/event-history/clear', {method: 'POST'});
+        const result = await response.json();
+        if (!result.ok) throw new Error(result.error || '清空失败');
+        byId('eventHistoryStatus').textContent = `已清空 ${result.cleared_records || 0} 条记录`;
+        await refresh();
+      } catch (error) {
+        byId('eventHistoryStatus').textContent = `清空失败：${error.message}`;
+      }
+    };
+    async function refresh() {
+      try {
+        const response = await fetch('/api/state', {cache: 'no-store'});
+        const state = await response.json();
+        const objectOnly = state.object_only === true;
+        document.body.classList.toggle('object-only', objectOnly);
+        byId('pageTitle').textContent = objectOnly ? 'MarsDog 物体识别调试' : 'MarsDog 视觉识别调试';
+        byId('pageSubtitle').textContent = objectOnly ? '相机原图 + /perception/vision/object_detections' : '相机原图 + /perception/visual_event + 物体检测 Topic';
+        byId('detectionsTitle').textContent = objectOnly ? '物体识别结果' : '手势与物体';
+        byId('rawSummary').textContent = objectOnly ? '查看原始物体检测 JSON' : '查看原始 visual_event JSON';
+        const rawEvent = state.visual_event || {};
+        const camera = state.camera || {};
+        const visual = state.visual || {};
+        const gestureMeta = state.gesture || {};
+        const task = state.object_task || {};
+        const enrollment = state.enrollment || {};
+        const publishedEventHistory = state.published_event_history || [];
+        const activePublishedEvents = state.active_published_events || [];
+        latestEventExport = {
+          exported_at: new Date().toISOString(),
+          topic: (state.visual || {}).topic || '/perception/visual_event',
+          meaning: 'Vision published events only; downstream selection/execution is not confirmed.',
+          active_events: activePublishedEvents,
+          history: publishedEventHistory,
+        };
+        showPublishedEvents(publishedEventHistory, activePublishedEvents);
+        const step = Number(enrollment.step || 0), total = Number(enrollment.total_steps || 5);
+        byId('enrollmentBar').style.width = `${Math.max(0, Math.min(100, enrollment.done ? 100 : (step - 1 + Number(enrollment.progress_pct || 0) / 100) / total * 100))}%`;
+        byId('enrollmentStatus').textContent = enrollment.status === 'idle'
+          ? '尚未开始'
+          : `${text(enrollment.name)} · ${Math.min(step, total)}/${total} · ${text(enrollment.prompt || enrollment.status)}`;
+        if (enrollment.done === true && !byId('faceList').dataset.doneName) {
+          byId('faceList').dataset.doneName = enrollment.name || 'done';
+          loadFaces().catch(() => {});
+        } else if (enrollment.done !== true) {
+          delete byId('faceList').dataset.doneName;
+        }
+        const visualFresh = Number.isFinite(Number(visual.age_ms)) && Number(visual.age_ms) <= 1000;
+        const gestureFresh = Number.isFinite(Number(gestureMeta.age_ms)) && Number(gestureMeta.age_ms) <= 1000;
+        const gesture = gestureFresh ? (state.gesture_debug || {}) : {};
+        const event = objectOnly ? rawEvent : visualFresh ? rawEvent : {active_target: {tracking_state: 'visual event stale'}, tracked_objects: rawEvent.tracked_objects || []};
+        badge(byId('cameraBadge'), '相机', camera.age_ms, 1000);
+        badge(byId('visualBadge'), '视觉事件', visual.age_ms, 1000);
+        badge(byId('gestureBadge'), '动作调试', gestureMeta.age_ms, 1000);
+        const objectStream = task.stream || {};
+        const objectActive = objectStream.active === true;
+        const objectDebugActive = objectActive && objectStream.session_id === objectDebugSession;
+        const objectStopped = String(task.status || '').includes('stopped');
+        const objectOneShotOk = task.success === true && String(task.status || '') === 'topic ok';
+        byId('objectBadge').className = 'badge ' + (task.success === true && (objectActive || objectOneShotOk) ? 'ok' : task.pending || task.success == null || objectStopped ? 'warn' : 'bad');
+        byId('objectBadge').textContent = `物体识别：${task.pending ? '识别中' : objectActive ? `${text(objectStream.session_id)} · ${fixed(task.latency_ms, 0)} ms` : objectOneShotOk ? `单次完成 · ${fixed(task.latency_ms, 0)} ms` : objectStopped ? `已停止 (${text(task.stop_reason)})` : '等待手动或任务触发'}`;
+        byId('startObjectStream').disabled = objectControlPending || (objectActive && !objectDebugActive);
+        byId('stopObjectStream').disabled = objectControlPending || !(objectDebugActive || objectDebugDesired);
+        if (objectDebugActive) {
+          objectDebugDesired = true;
+          startObjectLeaseTimer();
+          if (!objectControlPending) byId('objectManualStatus').textContent = `持续识别中：${fixed(objectStream.rate_hz, 1)} Hz · 租约 ${fixed(objectStream.lease_remaining_sec, 0)}s`;
+        } else if (objectActive && !objectDebugActive) {
+          objectDebugDesired = false;
+          stopObjectLeaseTimer();
+          if (!objectControlPending) byId('objectManualStatus').textContent = `持续识别由 ${text(objectStream.session_id)} 持有，页面不会抢占`;
+        } else if (!objectDebugDesired && objectLeaseTimer !== null) {
+          stopObjectLeaseTimer();
+        }
+        byId('frameInfo').textContent = `${camera.width || 0}×${camera.height || 0} · 输入 ${fixed(camera.fps, 1)} / 页面 ${fixed(camera.render_fps, 1)} FPS · ${text(camera.encoding)}`;
+        const humans = event.humans || [], faces = event.faces || [], hands = event.hands || [], objects = event.tracked_objects || [];
+        byId('humanCount').textContent = humans.length;
+        byId('faceCount').textContent = faces.length;
+        byId('handCount').textContent = hands.length;
+        byId('objectCount').textContent = objects.length;
+        const active = event.active_target || {};
+        const recognized = gesture.recognized_actions || [];
+        const recognizedNames = recognized.map(item => item.name).filter(Boolean);
+        const topCandidate = (gesture.raw_scores || [])[0] || {};
+        const temporal = gesture.temporal_features || {};
+        const fall = gesture.fall_detector || {};
+        const handFeatures = gesture.hand_features || {};
+        const leftHandFeatures = handFeatures.left || {};
+        const rightHandFeatures = handFeatures.right || {};
+        const landmarker = gesture.landmarker || {};
+        const poseMetrics = landmarker.pose || {};
+        const handMetrics = landmarker.hand || {};
+        setKv(byId('target'), [
+          ['Track ID', active.track_id], ['跟踪状态', active.tracking_state],
+          ['身份', active.identity], ['身份置信度', fixed(active.identity_confidence)],
+          ['姿态事件门控', active.tracking_state === 'tracking' && active.identity_state === 'confirmed_known' && faceLabels[active.identity] ? 'open · 已登记身份' : 'blocked · 身份未确认或目标已丢失'],
+          ['粗姿态 pose_state', active.pose_state], ['精确识别动作', recognizedNames.join(', ')],
+          ['最高原始候选', topCandidate.name ? `${topCandidate.name} (${fixed(topCandidate.score)})` : '—'],
+          ['兼容动作字段', active.pose_action_label || active.pose_action],
+          ['目标置信度', fixed(active.confidence)], ['最后看见', fixed(active.last_seen_age_ms, 0) + ' ms'],
+        ]);
+        setKv(byId('landmarker'), [
+          ['Pose模型', `${text(landmarker.pose_model_variant)} / ${text(landmarker.pose_model_file)}`],
+          ['运行模式', landmarker.running_mode],
+          ['统计窗口', `${text(landmarker.window_frames)} 推理帧`],
+          ['接收/候选/完成', `${text(landmarker.received_frames)} / ${text(landmarker.inference_candidates)} / ${text(landmarker.inferred_frames)}`],
+          ['被新帧替换', landmarker.replaced_pending_frames],
+          ['有效推理频率', `${fixed(landmarker.effective_inference_fps, 1)} FPS`],
+          ['整条流水线', `${fixed(landmarker.pipeline_avg_ms, 1)} / P95 ${fixed(landmarker.pipeline_p95_ms, 1)} ms`],
+          ['Pose耗时', `${fixed(poseMetrics.avg_ms, 1)} / P95 ${fixed(poseMetrics.p95_ms, 1)} ms`],
+          ['人体检测率', percent(poseMetrics.detection_rate)],
+          ['33点有效率', percent(poseMetrics.keypoint_valid_ratio)],
+          ['动作关键点有效率', percent(poseMetrics.critical_keypoint_valid_ratio)],
+          ['Hand耗时', `${fixed(handMetrics.avg_ms, 1)} / P95 ${fixed(handMetrics.p95_ms, 1)} ms`],
+          ['Hand频率', `${fixed(handMetrics.effective_inference_fps, 1)} FPS / 空闲步长 ${text(handMetrics.idle_inference_stride)}`],
+          ['手部检测率', percent(handMetrics.detection_rate)],
+        ]);
+        setKv(byId('gestureSummary'), [
+          ['主动作', gesture.primary_action], ['动作优先级', gesture.primary_priority],
+          ['当前帧人脸确认', gesture.face_observed === true ? '是' : gesture.face_observed === false ? '否' : '未启用门控'],
+          ['状态提示', gesture.state_hint], ['跌倒阶段', gesture.fall_phase],
+          ['跌倒已布防', fall.armed === true ? '是' : '否'],
+          ['躺卧判定分', fixed(fall.lying_score, 3)],
+          ['跌倒转换分', fixed(fall.transition_score, 3)],
+          ['跌倒报警保持', fall.alert_active === true ? '是' : '否'],
+          ['左手四指伸直', `${text(leftHandFeatures.four_fingers_extended)}/4`],
+          ['左手掌朝向分', fixed(leftHandFeatures.palm_facing_score, 3)],
+          ['左手运动能量', fixed(leftHandFeatures.motion_energy, 3)],
+          ['右手四指伸直', `${text(rightHandFeatures.four_fingers_extended)}/4`],
+          ['右手掌朝向分', fixed(rightHandFeatures.palm_facing_score, 3)],
+          ['右手运动能量', fixed(rightHandFeatures.motion_energy, 3)],
+          ['粗姿态', gesture.pose_state], ['兼容姿态动作', gesture.legacy_pose_action],
+          ['已稳定识别', recognizedNames.join(', ') || '尚未达到稳定触发阈值'],
+          ['点头垂直能量', fixed(temporal.head_vertical_motion_energy, 3)],
+          ['点头方向反转', temporal.head_vertical_direction_changes],
+          ['点头位移幅度', fixed(temporal.head_vertical_range_ratio, 3)],
+          ['当前双手间距', fixed(temporal.wrist_distance_ratio, 3)],
+          ['双手间距范围', fixed(temporal.wrist_distance_range_ratio, 3)],
+          ['双手开合反转', temporal.wrist_distance_direction_changes],
+          ['时序窗口', `${text(temporal.window_frames)} 帧 / ${fixed(temporal.window_duration_s, 2)} 秒`],
+        ]);
+        const recognizedMap = new Map(recognized.map(item => [item.name, item]));
+        setRows(byId('gestureScores'), (gesture.raw_scores || []).map(item => {
+          const hit = recognizedMap.get(item.name);
+          return [hit ? '✓' : '', item.name, item.priority, item.group, fixed(item.score), hit ? fixed(hit.confidence) : '—'];
+        }), 6);
+        Array.from(byId('gestureScores').rows).forEach(row => {
+          if (row.cells[0] && row.cells[0].textContent === '✓') row.className = 'recognized';
+        });
+        byId('gestureTiming').textContent = `规则 ${fixed(gesture.recognition_ms, 2)} ms`;
+        setRows(byId('humans'), humans.map(h => [h.track_id, h.pose_state, h.pose_action_label || h.pose_action, fixed(h.confidence)]), 4);
+        setRows(byId('faces'), faces.map(f => [f.track_id, f.recognized_user || 'unknown', f.identity_state, fixed(f.identity_confidence || f.confidence)]), 4);
+        const detectionRows = hands.map(h => ['手部 ' + text(h.handedness), h.hand_action_label || h.hand_action, `${(h.landmarks || []).length} 点`]);
+        objects.forEach(o => detectionRows.push(['物体', o.label, fixed(o.confidence)]));
+        setRows(byId('detections'), detectionRows, 3);
+        byId('objectError').textContent = task.error || '';
+        const control = state.control || {}, cmd = state.cmd_vel || {};
+        setKv(byId('events'), [
+          ['视觉事件', (event.events || []).join(', ')], ['跟随模式', control.mode || (control.enabled ? 'enabled' : 'disabled')],
+          ['linear.x', fixed(cmd.linear_x, 3)], ['angular.z', fixed(cmd.angular_z, 3)],
+          ['相机 Topic', camera.topic], ['视觉 Topic', visual.topic],
+        ]);
+        byId('raw').textContent = JSON.stringify(rawEvent, null, 2);
+        byId('gestureRaw').textContent = JSON.stringify(state.gesture_debug || {}, null, 2);
+      } catch (error) {
+        byId('cameraBadge').className = 'badge bad';
+        byId('cameraBadge').textContent = '调试节点：连接失败';
+      }
+    }
+    loadFaces().catch(error => {
+      byId('faceActionError').textContent = error.message;
+    });
+    refresh();
+    setInterval(refresh, 350);
+  </script>
+</body>
+</html>

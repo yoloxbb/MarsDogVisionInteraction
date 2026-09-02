@@ -7,8 +7,10 @@ when no real camera or vision model is available.
 from __future__ import annotations
 
 import logging
+import copy
 from typing import Any
 
+from marsdog_vision_interaction.fusion.stereo_fusion import get_target_manager
 from marsdog_vision_interaction.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -56,8 +58,20 @@ class MockVisionProvider(BaseProvider):
             "hands": [],
             "tracked_objects": [],
         }
+        manager = get_target_manager()
+        manager.update_vision(obs["humans"], obs["faces"])
+        snapshot = manager.get_snapshot()
+        active = snapshot["active_target"]
+        active_dict = active.to_dict()
+        obs.update({
+            "vision_epoch": snapshot["vision_epoch"],
+            "active_target": active_dict,
+            "human_candidates": snapshot["human_candidates"],
+        })
+        if active.track_id > 0:
+            obs["humans"][0]["track_id"] = active.track_id
         self._last_observation = obs
-        return obs
+        return copy.deepcopy(obs)
 
     def detect_objects(self, params: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Return mock object detection — a red ball.
@@ -90,11 +104,20 @@ class MockVisionProvider(BaseProvider):
             Dict with present and count keys.
         """
         obs = self._last_observation or self.get_observation()
+        candidates = [
+            item
+            for item in obs.get("human_candidates", [])
+            if item.get("tracking_state") == "tracking"
+        ]
         humans = obs.get("humans", [])
-        count = len(humans)
+        count = len(candidates) if candidates else len(humans)
         return {
             "present": count > 0,
             "count": count,
+            "identity": str(
+                obs.get("active_target", {}).get("identity", "unknown")
+            ),
+            "target": dict(obs.get("active_target", {})),
         }
 
     def enroll_face(self, face_image: Any = None) -> dict[str, Any]:

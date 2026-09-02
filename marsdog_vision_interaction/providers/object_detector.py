@@ -1,9 +1,8 @@
-"""Object detection provider — YOLOE-seg RKNN inference.
+"""Ultralytics YOLOE object detection provider.
 
-Real RKNN model for on-demand object detection via /perception/perception_task.
-Lazy-loaded: model is only initialized on first detect_objects() call.
-
-Model: YOLOE-26s-seg, 16 dog-related classes, 640x640 input.
+Ultralytics owns image preprocessing, the exported-model backend, NMS, and
+``Results`` decoding.  The configured model is currently an RKNN export, so
+Ultralytics still executes it on the Rockchip NPU through rknn-toolkit-lite2.
 """
 
 from __future__ import annotations
@@ -14,363 +13,269 @@ from typing import Any
 
 import numpy as np
 
+from marsdog_vision_interaction.core.object_detection_session import (
+    ObjectDetectionSessionManager,
+)
 from marsdog_vision_interaction.providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
-# Model classes
-_CLASS_NAMES = {
-    0: "dog toy ball",
-    1: "dog frisbee toy",
-    2: "dog tug ring toy",
-    3: "dog collar",
-    4: "dog bowl",
-    5: "dog leash",
-    6: "dog treat bag",
-    7: "dog food can",
-    8: "dog bed",
-    9: "trash can",
-    10: "cardboard shipping box",
-    11: "sock",
-    12: "slipper",
-    13: "tissue paper",
-    14: "door",
-    15: "stairs",
-    16: "cat",
-    17: "dog",
-}
-
-_IMG_SIZE = 640
-_NUM_CLASSES = 18
-_NUM_MASKS = 32
-
 
 class ObjectDetectorProvider(BaseProvider):
-    """On-demand YOLOE-seg RKNN object detector.
-
-    Lazy-loads ~23MB RKNN model on first detect_objects() call.
-    Inference at 640x640, ~50-100ms on RK3588 (3 NPU cores).
-    """
+    """Lazy-loaded Ultralytics YOLOE detector with a stable ROS result shape."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
-
-        self._model_path = config.get("object_rknn_model", "")
+        # ``object_rknn_model`` remains accepted for existing local configs.
+        self._model_path = str(
+            config.get("object_model", config.get("object_rknn_model", ""))
+        )
         self._det_threshold = float(config.get("det_threshold", 0.5))
         self._nms_threshold = float(config.get("nms_threshold", 0.45))
+        self._max_detections = max(
+            1, int(config.get("max_detections", 100))
+        )
+        self._image_size = max(32, int(config.get("image_size", 640)))
+        self._mock_mode = bool(config.get("mock_mode", False))
 
-        self._rknn: Any = None
+        self._model: Any = None
         self._loaded = False
-
-    # ── Lifecycle ──────────────────────────────────────────────
+        self.last_error = ""
 
     def start(self) -> None:
-        try:
-            logger.info("ObjectDetectorProvider — lazy-load, model=%s", self._model_path)
+        self.last_error = ""
+        if self._mock_mode:
             self.available = True
-            logger.info("ObjectDetectorProvider started (lazy)")
-        except Exception as exc:
+            logger.info("ObjectDetectorProvider started (explicit mock)")
+            return
+        if not self._model_path:
             self.available = False
-            logger.warning("ObjectDetectorProvider start failed: %s", exc)
+            self.last_error = "object model path is not configured"
+            logger.error(self.last_error)
+            return
+        self.available = True
+        logger.info(
+            "ObjectDetectorProvider — Ultralytics lazy-load, model=%s",
+            self._model_path,
+        )
 
     def stop(self) -> None:
-        if self._rknn is not None:
-            try:
-                self._rknn.release()
-            except Exception:
-                pass
-            self._rknn = None
+        self._release_runtime()
+        self._model = None
         self._loaded = False
         self.available = False
         logger.info("ObjectDetectorProvider stopped")
 
-    # ── Public API ─────────────────────────────────────────────
-
     def detect_objects(
-        self, frame: Any = None, params: list[dict[str, Any]] | None = None,
+        self,
+        frame: Any = None,
+        params: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Detect objects in a BGR camera frame.
+        """Detect objects and return normalized boxes for the ROS contract."""
+        self.last_error = ""
+        try:
+            target_labels = ObjectDetectionSessionManager.normalize_target_labels(
+                params.get("target_labels") if isinstance(params, dict) else None
+            )
+        except ValueError as exc:
+            self.last_error = str(exc)
+            return []
+        if self._mock_mode:
+            return self._filter_target_labels(
+                self._mock_objects(), target_labels
+            )
 
-        Args:
-            frame: BGR numpy array from camera.
-            params: Optional [{key: confidence, value: 0.3}, ...].
+        threshold = self._confidence_from_params(params)
+        if not self.available:
+            self.last_error = self.last_error or "object detector unavailable"
+            return []
+        if frame is None:
+            self.last_error = "camera frame unavailable or stale"
+            return []
+        if not self._loaded and not self._load_model():
+            return []
 
-        Returns:
-            List of dicts with label, x, y, w, h, confidence, center_x, center_y.
-        """
-        # Parse params
+        try:
+            return self._filter_target_labels(
+                self._run_inference(frame, threshold),
+                target_labels,
+            )
+        except Exception as exc:
+            logger.error(
+                "Ultralytics object detection failed: %s",
+                exc,
+                exc_info=True,
+            )
+            self.available = False
+            self.last_error = f"object inference failed: {exc}"
+            return []
+
+    def _confidence_from_params(
+        self,
+        params: dict[str, Any] | list[dict[str, Any]] | None,
+    ) -> float:
         threshold = self._det_threshold
-        if params:
-            for p in params:
-                if p.get("key") == "confidence":
+        if isinstance(params, dict):
+            try:
+                threshold = float(params.get("confidence", threshold))
+            except (ValueError, TypeError):
+                pass
+        elif params:
+            for item in params:
+                if item.get("key") == "confidence" or "confidence" in item:
                     try:
-                        threshold = float(p["value"])
+                        threshold = float(
+                            item.get("value", item.get("confidence"))
+                        )
                     except (ValueError, TypeError):
                         pass
-
-        if not self.available:
-            return self._mock_objects()
-        if frame is None:
-            return self._mock_objects()
-
-        # Lazy-load on first call
-        if not self._loaded:
-            if not self._load_model():
-                return self._mock_objects()
-
-        try:
-            return self._run_inference(frame, threshold)
-        except Exception as exc:
-            logger.error("Object detection error: %s", exc, exc_info=True)
-            return self._mock_objects()
-
-    # ── Model loading ──────────────────────────────────────────
+        return min(1.0, max(0.0, threshold))
 
     def _load_model(self) -> bool:
-        """Load RKNN model from disk."""
-        import os
-        from rknnlite.api import RKNNLite
-
-        # Support both directory and direct file paths
-        if os.path.isdir(self._model_path):
-            # Find .rknn file in directory
-            for f in os.listdir(self._model_path):
-                if f.endswith(".rknn"):
-                    model_file = os.path.join(self._model_path, f)
-                    break
-            else:
-                logger.error("No .rknn file found in %s", self._model_path)
-                self._loaded = True
-                return False
-        else:
-            model_file = self._model_path
-
+        """Create the YOLOE wrapper; its exported backend loads on predict."""
         try:
-            t0 = time.perf_counter()
-            self._rknn = RKNNLite()
-            ret = self._rknn.load_rknn(model_file)
-            if ret != 0:
-                logger.error("RKNN load_rknn failed: ret=%d", ret)
-                self._loaded = True
-                return False
+            from ultralytics import YOLOE
 
-            ret = self._rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)
-            if ret != 0:
-                logger.error("RKNN init_runtime failed: ret=%d", ret)
-                self._loaded = True
-                return False
-
-            elapsed = (time.perf_counter() - t0) * 1000
+            started = time.perf_counter()
+            self._model = YOLOE(self._model_path)
             self._loaded = True
             logger.info(
-                "YOLOE-seg RKNN loaded: %s (%.0fms)", model_file, elapsed,
+                "Ultralytics YOLOE initialized: %s (%.0fms)",
+                self._model_path,
+                (time.perf_counter() - started) * 1000.0,
             )
             return True
-
         except Exception as exc:
-            logger.error("RKNN load failed: %s", exc)
+            logger.error("Ultralytics YOLOE load failed: %s", exc)
             self._loaded = True
+            self.available = False
+            self.last_error = f"object model unavailable: {exc}"
             return False
 
-    # ── Inference ──────────────────────────────────────────────
-
     def _run_inference(
-        self, frame: np.ndarray, threshold: float,
+        self,
+        frame: np.ndarray,
+        threshold: float,
     ) -> list[dict[str, Any]]:
-        """Run full inference pipeline: preprocess → RKNN → postprocess.
-
-        Args:
-            frame: BGR numpy array (H, W, 3).
-            threshold: Confidence threshold.
-
-        Returns:
-            List of detected object dicts.
-        """
-        import cv2
-
-        h, w = frame.shape[:2]
-
-        # ── Preprocess ──────────────────────────────────────
-        # Resize to 640x640, BGR→RGB, uint8 [0-255]
-        resized = cv2.resize(frame, (_IMG_SIZE, _IMG_SIZE))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        # NCHW format
-        input_data = np.expand_dims(rgb.transpose(2, 0, 1), axis=0).astype(np.uint8)
-
-        # ── Inference ───────────────────────────────────────
-        outputs = self._rknn.inference([input_data])
-        # Output 0: (1, 54, 8400) — 4 bbox + 18 cls + 32 mask = 54
-        # Output 1: (1, 32, 160, 160) — proto masks (unused for bbox-only)
-
-        # ── Postprocess ─────────────────────────────────────
-        objects = self._postprocess(outputs, threshold, h, w)
-
+        """Run Ultralytics preprocessing, inference, NMS, and decoding."""
+        started = time.perf_counter()
+        results = self._model.predict(
+            source=frame,
+            conf=threshold,
+            iou=self._nms_threshold,
+            max_det=self._max_detections,
+            imgsz=self._image_size,
+            save=False,
+            verbose=False,
+        )
+        objects = self._results_to_objects(results)
         logger.info(
-            "YOLOE-seg: %d objects (%dx%d→640x640, thr=%.2f)",
-            len(objects), w, h, threshold,
+            "Ultralytics YOLOE: %d objects (%.1fms, conf=%.2f, iou=%.2f)",
+            len(objects),
+            (time.perf_counter() - started) * 1000.0,
+            threshold,
+            self._nms_threshold,
         )
         return objects
 
-    def _postprocess(
-        self, outputs: list[np.ndarray], threshold: float,
-        orig_h: int, orig_w: int,
-    ) -> list[dict[str, Any]]:
-        """Decode YOLO outputs — decode ALL boxes, then filter by conf + NMS.
-
-        Output format (not end2end):
-          [0]: (1, 4+16+32=52, 8400) — bbox + class_scores + mask_coeffs
-          8400 = 80² + 40² + 20² (3 detection heads)
-        """
-        det = outputs[0][0]  # (52, 8400)
-
-        # Split channels
-        boxes_raw = det[:4, :]                 # (4, 8400) — cx, cy, w, h
-        class_raw = det[4:4 + _NUM_CLASSES, :]  # (16, 8400)
-
-        # Sigmoid
-        boxes_sig = 1.0 / (1.0 + np.exp(-boxes_raw))  # (4, 8400)
-        class_scores = 1.0 / (1.0 + np.exp(-class_raw))  # (16, 8400)
-
-        # Decode ALL 8400 boxes first (need grid info before filtering)
-        boxes_px = self._decode_all_boxes(boxes_sig)  # (8400, 4)
-
-        # Max score and class per anchor
-        scores = class_scores.max(axis=0)  # (8400,)
-        class_ids = class_scores.argmax(axis=0)  # (8400,)
-
-        # Filter by confidence
-        keep = scores > threshold
-        if not np.any(keep):
+    def _results_to_objects(self, results: Any) -> list[dict[str, Any]]:
+        """Convert the first Ultralytics ``Results.boxes`` to ROS fields."""
+        if not results:
+            return []
+        result = results[0]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
             return []
 
-        boxes_px = boxes_px[keep]
-        scores = scores[keep]
-        class_ids = class_ids[keep]
+        xyxyn = self._as_numpy(getattr(boxes, "xyxyn", [])).reshape(-1, 4)
+        confidences = self._as_numpy(
+            getattr(boxes, "conf", [])
+        ).reshape(-1)
+        class_ids = self._as_numpy(getattr(boxes, "cls", [])).reshape(-1)
+        names = getattr(result, "names", {})
 
-        # Scale to original frame
-        scale_x = orig_w / _IMG_SIZE
-        scale_y = orig_h / _IMG_SIZE
-        boxes_px[:, 0] *= scale_x
-        boxes_px[:, 1] *= scale_y
-        boxes_px[:, 2] *= scale_x
-        boxes_px[:, 3] *= scale_y
-
-        # NMS
-        keep_idx = self._nms(boxes_px, scores, class_ids)
-
-        # Build result — filter tiny noise boxes
-        min_area_px = orig_w * orig_h * 0.005  # 0.5% of frame area minimum
-
-        objects = []
-        for idx in keep_idx:
-            x1, y1, x2, y2 = boxes_px[idx]
-            bw, bh = x2 - x1, y2 - y1
-            if bw < 3 or bh < 3 or bw * bh < min_area_px:
+        count = min(
+            len(xyxyn),
+            len(confidences),
+            len(class_ids),
+            self._max_detections,
+        )
+        objects: list[dict[str, Any]] = []
+        for index in range(count):
+            x1, y1, x2, y2 = np.clip(xyxyn[index], 0.0, 1.0)
+            width = max(0.0, float(x2 - x1))
+            height = max(0.0, float(y2 - y1))
+            if width <= 0.0 or height <= 0.0:
                 continue
-            cid = int(class_ids[idx])
+            class_id = int(class_ids[index])
+            if isinstance(names, dict):
+                label = str(names.get(class_id, f"class_{class_id}"))
+            elif isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+                label = str(names[class_id])
+            else:
+                label = f"class_{class_id}"
             objects.append({
-                "label": _CLASS_NAMES.get(cid, f"class_{cid}"),
-                "x": round(float(x1 / orig_w), 4),
-                "y": round(float(y1 / orig_h), 4),
-                "w": round(float(bw / orig_w), 4),
-                "h": round(float(bh / orig_h), 4),
-                "confidence": round(float(scores[idx]), 4),
-                "center_x": round(float((x1 + x2) / 2 / orig_w), 4),
-                "center_y": round(float((y1 + y2) / 2 / orig_h), 4),
+                "label": label,
+                "x": round(float(x1), 4),
+                "y": round(float(y1), 4),
+                "w": round(width, 4),
+                "h": round(height, 4),
+                "confidence": round(float(confidences[index]), 4),
+                "center_x": round(float((x1 + x2) / 2.0), 4),
+                "center_y": round(float((y1 + y2) / 2.0), 4),
             })
         return objects
 
-    def _decode_all_boxes(self, boxes_sig: np.ndarray) -> np.ndarray:
-        """Decode all 8400 boxes using proper multi-scale grid.
+    @staticmethod
+    def _as_numpy(value: Any) -> np.ndarray:
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            value = to_numpy()
+        return np.asarray(value)
 
-        Multi-scale: 80×80(stride 8), 40×40(stride 16), 20×20(stride 32).
-        boxes_sig: (4, 8400) sigmoid-activated raw box predictions.
-        Returns: (8400, 4) x1,y1,x2,y2 in 640x640 space.
-        """
-        all_boxes = []
-        offset = 0
-        for grid_h, grid_w, stride in [(80, 80, 8), (40, 40, 16), (20, 20, 32)]:
-            n_cells = grid_h * grid_w
-            chunk = boxes_sig[:, offset:offset + n_cells]  # (4, n_cells)
+    def _release_runtime(self) -> None:
+        """Best-effort release of RKNNLite hidden behind AutoBackend."""
+        try:
+            predictor = getattr(self._model, "predictor", None)
+            auto_backend = getattr(predictor, "model", None)
+            backend = getattr(auto_backend, "backend", None)
+            runtime = getattr(backend, "model", None)
+            release = getattr(runtime, "release", None)
+            if callable(release):
+                release()
+        except Exception as exc:
+            logger.debug("Ultralytics backend release failed: %s", exc)
 
-            # Grid coordinates
-            gy, gx = np.meshgrid(np.arange(grid_h), np.arange(grid_w), indexing='ij')
-            gx = gx.ravel().astype(np.float32)
-            gy = gy.ravel().astype(np.float32)
-
-            # Decode: cx = (sig*2 - 0.5 + grid_x) * stride
-            cx = (chunk[0] * 2.0 - 0.5 + gx) * stride
-            cy = (chunk[1] * 2.0 - 0.5 + gy) * stride
-            w = (chunk[2] * 2.0) ** 2 * stride
-            h = (chunk[3] * 2.0) ** 2 * stride
-
-            x1 = cx - w / 2
-            y1 = cy - h / 2
-            x2 = cx + w / 2
-            y2 = cy + h / 2
-
-            boxes = np.stack([x1, y1, x2, y2], axis=1)  # (n_cells, 4)
-            all_boxes.append(boxes)
-            offset += n_cells
-
-        return np.concatenate(all_boxes, axis=0).astype(np.float32)
-
-    def _nms(
-        self, boxes: np.ndarray, scores: np.ndarray, class_ids: np.ndarray,
-    ) -> list[int]:
-        """Simple class-aware NMS.
-
-        Args:
-            boxes: (N, 4) x1, y1, x2, y2.
-            scores: (N,) confidence.
-            class_ids: (N,) class IDs.
-
-        Returns:
-            List of indices to keep.
-        """
-        order = scores.argsort()[::-1]
-        keep = []
-
-        while len(order) > 0:
-            idx = order[0]
-            keep.append(int(idx))
-            if len(order) == 1:
-                break
-
-            # IoU of current best vs rest
-            box = boxes[idx]
-            other_boxes = boxes[order[1:]]
-
-            # Same class only
-            same_class = class_ids[order[1:]] == class_ids[idx]
-
-            xx1 = np.maximum(box[0], other_boxes[:, 0])
-            yy1 = np.maximum(box[1], other_boxes[:, 1])
-            xx2 = np.minimum(box[2], other_boxes[:, 2])
-            yy2 = np.minimum(box[3], other_boxes[:, 3])
-
-            w = np.maximum(0, xx2 - xx1)
-            h = np.maximum(0, yy2 - yy1)
-            inter = w * h
-
-            area_box = (box[2] - box[0]) * (box[3] - box[1])
-            area_other = (other_boxes[:, 2] - other_boxes[:, 0]) * (other_boxes[:, 3] - other_boxes[:, 1])
-            union = area_box + area_other - inter
-            iou = inter / np.maximum(union, 1e-6)
-
-            # Suppress high IoU + same class
-            suppress = (iou > self._nms_threshold) & same_class
-            order = order[1:][~suppress]
-
-        return keep
+    @staticmethod
+    def _filter_target_labels(
+        objects: list[dict[str, Any]],
+        target_labels: list[str],
+    ) -> list[dict[str, Any]]:
+        if not target_labels:
+            return objects
+        requested = {label.casefold() for label in target_labels}
+        return [
+            item
+            for item in objects
+            if str(item.get("label", "")).strip().casefold() in requested
+        ]
 
     @staticmethod
     def _mock_objects() -> list[dict[str, Any]]:
-        """Return mock detection when model unavailable."""
-        return [
-            {
-                "label": "red ball",
-                "x": 0.3, "y": 0.45, "w": 0.12, "h": 0.12,
-                "confidence": 0.88, "center_x": 0.36, "center_y": 0.51,
-            }
-        ]
+        """Return deterministic data only when mock mode was explicit."""
+        return [{
+            "label": "dog toy ball",
+            "x": 0.3,
+            "y": 0.45,
+            "w": 0.12,
+            "h": 0.12,
+            "confidence": 0.88,
+            "center_x": 0.36,
+            "center_y": 0.51,
+        }]

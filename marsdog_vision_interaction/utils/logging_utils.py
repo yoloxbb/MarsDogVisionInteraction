@@ -27,8 +27,8 @@ class StructuredLogger(logging.Logger):
     """Logger subclass that supports key=value structured logging.
 
     Usage:
-        logger.info("camera_init", device="/dev/video0", width=640)
-        # → "camera_init  device='/dev/video0'  width=640"
+        logger.info("camera_init", device="0", width=640)
+        # → "camera_init  device='0'  width=640"
     """
 
     def _log_with_kwargs(self, level: int, msg: str, *args: Any, **kwargs: Any) -> None:

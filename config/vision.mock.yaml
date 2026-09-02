@@ -2,22 +2,43 @@ logging:
   level: INFO
   dir: log
 storage:
-  root: /tmp/marsdog_vision_mock_data
+  root: ${MARSDOG_VISION_DATA_DIR}/mock
+face_api:
+  enabled: false
 topics:
   camera_image: /camera/mock_image_raw
   visual_event: /perception/visual_event
+  object_detections: /perception/vision/object_detections
+  gesture_debug: /perception/vision/gesture_debug
   enrollment_event: /perception/vision/enrollment_event
   vision_task: /perception/vision/task
   observation_rate_hz: 10.0
+  camera_stale_timeout_sec: 0.5
+  object_cache_timeout_sec: 2.0
+depth_fusion:
+  # The mock has no geometrically registered depth source. It must advertise
+  # range_valid=false instead of manufacturing a movement distance.
+  enabled: false
+  target_current_timeout_sec: 0.35
 providers:
   vision:
     type: mock
     enabled: true
-    config: {}
+    config:
+      max_num_poses: 5
+      horizontal_fov_deg: 69.0
   object:
     type: mock
     enabled: true
-    config: {}
+    config:
+      inference_rate_hz: 0.0
+      on_demand_rate_hz: 2.0
+      max_inference_rate_hz: 5.0
+      default_lease_sec: 3.0
+      max_lease_sec: 30.0
+      scheduler_rate_hz: 20.0
+      target_current_timeout_sec: 0.75
+      target_persistence_sec: 2.0
   face_recognition:
     type: mock
     enabled: true

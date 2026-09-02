@@ -3,6 +3,7 @@ include package.xml
 recursive-include config *.yaml
 recursive-include docs *.md
 recursive-include launch *.py
+recursive-include marsdog_vision_interaction/web *.html
 recursive-include resource *
 recursive-include scripts *
 recursive-include srv *.srv

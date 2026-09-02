@@ -45,13 +45,11 @@ _EMOTION_EVENTS = {
 }
 
 
-def pose_action_to_vision_event(action: str, identity_known: bool) -> str:
-    if not action:
+def pose_action_to_vision_event(action: str, identity_confirmed: bool) -> str:
+    if not action or not identity_confirmed:
         return ""
     if action in _SPECIAL_ACTION_EVENTS:
         return _SPECIAL_ACTION_EVENTS[action]
-    if not identity_known:
-        return ""
     return _EMOTION_EVENTS.get(_ACTION_EMOTION.get(action, ""), "")
 
 

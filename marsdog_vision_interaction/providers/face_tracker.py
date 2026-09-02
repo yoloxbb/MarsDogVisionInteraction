@@ -188,7 +188,7 @@ class FaceRecognitionThrottle:
         self._cosine_threshold = sface_cosine_threshold
 
         self._tracks: dict[int, TrackState] = {}
-        self._enrolled_embeddings: dict[str, np.ndarray] = {}  # name → embedding
+        self._enrolled_embeddings: dict[str, list[np.ndarray]] = {}
 
     # ── Public API ──────────────────────────────────────────────
 
@@ -239,6 +239,8 @@ class FaceRecognitionThrottle:
         if track_id < 0:
             return
         track = self._get_or_create(track_id, now)
+        previous_identity = track.identity
+        previous_state = track.identity_state
         track.recognition_attempts += 1
         track.last_recognition_ts = now
 
@@ -267,6 +269,19 @@ class FaceRecognitionThrottle:
             elif track.consecutive_unknown >= 1:
                 if track.identity_state not in ("confirmed_known", "candidate_known"):
                     track.identity_state = "unknown_candidate"
+        if (
+            track.identity != previous_identity
+            or track.identity_state != previous_state
+        ):
+            logger.info(
+                "Face identity changed: track=%d identity=%s state=%s "
+                "confidence=%.4f attempts=%d",
+                track_id,
+                track.identity,
+                track.identity_state,
+                float(confidence),
+                track.recognition_attempts,
+            )
 
     def mark_seen(self, track_id: int, bbox_xyxy: np.ndarray, now: float) -> None:
         """Update track last-seen timestamp and bbox."""
@@ -279,8 +294,13 @@ class FaceRecognitionThrottle:
     def get_track_state(self, track_id: int) -> TrackState | None:
         return self._tracks.get(track_id)
 
-    def set_enrolled_embeddings(self, enrolled: dict[str, np.ndarray]) -> None:
-        self._enrolled_embeddings = enrolled
+    def set_enrolled_embeddings(
+        self, enrolled: dict[str, list[np.ndarray] | np.ndarray]
+    ) -> None:
+        self._enrolled_embeddings = {
+            name: value if isinstance(value, list) else [value]
+            for name, value in enrolled.items()
+        }
 
     @property
     def enrolled_count(self) -> int:

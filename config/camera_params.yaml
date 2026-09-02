@@ -1,9 +1,12 @@
-# Camera driver parameters
-# Usage: uv run camera-driver --ros-args --params-file config/camera_params.yaml
+# Legacy standalone V4L2 driver parameters for the retired WN binocular camera.
+# This file is NOT loaded by vision.launch.py and is not the current RealSense
+# input configuration. Current production vision subscribes to the external
+# /camera/camera/color/image_raw stream configured in vision.yaml.
 
 camera_driver:
   ros__parameters:
-    device: "/dev/video4"
+    # Portable OpenCV camera index. Override this parameter locally if needed.
+    device: "4"
     width: 640
     # This binocular camera exposes both 320x240 eyes in one 640x240 frame.
     height: 240

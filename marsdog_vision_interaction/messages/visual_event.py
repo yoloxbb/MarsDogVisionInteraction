@@ -11,6 +11,9 @@ from marsdog_vision_interaction.utils.time_utils import now_stamp
 SCHEMA_VERSION = 1
 
 _ACTIVE_TARGET = {
+    "vision_epoch": "",
+    "target_id": "",
+    "target_type": "human",
     "track_id": 0,
     "face_track_id": -1,
     "identity": "unknown",
@@ -22,6 +25,7 @@ _ACTIVE_TARGET = {
     "is_speaking": False,
     "is_registered": False,
     "bbox": [0.0, 0.0, 0.0, 0.0],
+    "center": [0.0, 0.0],
     "face_bbox": [0.0, 0.0, 0.0, 0.0],
     "face_center": [0.0, 0.0],
     "body_center": [0.0, 0.0],
@@ -30,11 +34,26 @@ _ACTIVE_TARGET = {
     "pose_action_label": "",
     "keypoints": [],
     "confidence": 0.0,
+    "detection_confidence": 0.0,
     "face_confidence": 0.0,
     "speaker_confidence": 0.0,
     "selection_reason": "",
     "tracking_state": "lost",
     "last_seen_age_ms": -1.0,
+    "bearing_deg": 0.0,
+    "bearing_valid": False,
+    "bearing_source": "",
+    "range_valid": False,
+    "distance_m": None,
+    "range_source": "none",
+    "depth_sync_delta_ms": None,
+    "pose_3d": {
+        "valid": False,
+        "frame_id": "",
+        "x": None,
+        "y": None,
+        "z": None,
+    },
 }
 
 _FACE = {
@@ -63,6 +82,46 @@ _HUMAN = {
     "keypoints": [],
 }
 
+_HUMAN_CANDIDATE = {
+    "vision_epoch": "",
+    "target_id": "",
+    "target_type": "human",
+    "track_id": -1,
+    "face_track_id": -1,
+    "identity": "unknown",
+    "identity_confidence": 0.0,
+    "identity_state": "unverified",
+    "is_registered": False,
+    "bbox": [0.0, 0.0, 0.0, 0.0],
+    "center": [0.0, 0.0],
+    "body_center": [0.0, 0.0],
+    "face_bbox": [0.0, 0.0, 0.0, 0.0],
+    "face_center": [0.0, 0.0],
+    "pose_state": "unknown",
+    "pose_action": "",
+    "pose_action_label": "",
+    "keypoints": [],
+    "confidence": 0.0,
+    "detection_confidence": 0.0,
+    "face_confidence": 0.0,
+    "tracking_state": "lost",
+    "last_seen_age_ms": -1.0,
+    "bearing_deg": 0.0,
+    "bearing_valid": False,
+    "bearing_source": "",
+    "range_valid": False,
+    "distance_m": None,
+    "range_source": "none",
+    "depth_sync_delta_ms": None,
+    "pose_3d": {
+        "valid": False,
+        "frame_id": "",
+        "x": None,
+        "y": None,
+        "z": None,
+    },
+}
+
 _HAND = {
     "handedness": "",
     "hand_action": "",
@@ -71,7 +130,14 @@ _HAND = {
 }
 
 _OBJECT = {
+    "vision_epoch": "",
+    "target_id": "",
+    "target_type": "object",
+    "track_id": -1,
+    "object_track_id": -1,
     "label": "",
+    "display_label": "",
+    "object_kind": "generic",
     "x": 0.0,
     "y": 0.0,
     "w": 0.0,
@@ -79,6 +145,25 @@ _OBJECT = {
     "confidence": 0.0,
     "center_x": 0.0,
     "center_y": 0.0,
+    "bbox": [0.0, 0.0, 0.0, 0.0],
+    "center": [0.0, 0.0],
+    "detection_confidence": 0.0,
+    "tracking_state": "lost",
+    "last_seen_age_ms": -1.0,
+    "bearing_deg": 0.0,
+    "bearing_valid": False,
+    "bearing_source": "",
+    "range_valid": False,
+    "distance_m": None,
+    "range_source": "none",
+    "depth_sync_delta_ms": None,
+    "pose_3d": {
+        "valid": False,
+        "frame_id": "",
+        "x": None,
+        "y": None,
+        "z": None,
+    },
 }
 
 
@@ -91,6 +176,23 @@ def _merge(template: dict[str, Any], value: Any) -> dict[str, Any]:
             continue
         if isinstance(default, list):
             result[key] = copy.deepcopy(value[key]) if isinstance(value[key], list) else []
+        elif isinstance(default, dict):
+            result[key] = (
+                _merge(default, value[key])
+                if isinstance(value[key], dict)
+                else copy.deepcopy(default)
+            )
+        elif default is None:
+            incoming = value[key]
+            if incoming is None:
+                result[key] = None
+            else:
+                try:
+                    result[key] = float(incoming)
+                except (TypeError, ValueError):
+                    result[key] = None
+        elif isinstance(default, bool):
+            result[key] = value[key] if isinstance(value[key], bool) else default
         else:
             try:
                 result[key] = type(default)(value[key])
@@ -103,7 +205,11 @@ def make_empty_visual_event() -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "header": {"stamp": now_stamp(), "frame_id": "camera_link"},
+        "vision_epoch": "",
+        "snapshot_id": "",
+        "sequence": 0,
         "active_target": copy.deepcopy(_ACTIVE_TARGET),
+        "human_candidates": [],
         "faces": [],
         "humans": [],
         "hands": [],
@@ -130,7 +236,19 @@ def normalize_visual_event(data: Any) -> dict[str, Any]:
             header.get("frame_id", event["header"]["frame_id"])
         )
 
+    event["vision_epoch"] = str(data.get("vision_epoch", ""))
+    event["snapshot_id"] = str(data.get("snapshot_id", ""))
+    try:
+        event["sequence"] = max(0, int(data.get("sequence", 0)))
+    except (TypeError, ValueError):
+        event["sequence"] = 0
+
     event["active_target"] = _merge(_ACTIVE_TARGET, data.get("active_target"))
+    event["human_candidates"] = [
+        _merge(_HUMAN_CANDIDATE, item)
+        for item in data.get("human_candidates", [])
+        if isinstance(item, dict)
+    ]
     event["faces"] = [
         _merge(_FACE, item) for item in data.get("faces", [])
         if isinstance(item, dict)

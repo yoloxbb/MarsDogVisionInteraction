@@ -1,0 +1,51 @@
+logging:
+  level: INFO
+  dir: log
+
+storage:
+  root: ${MARSDOG_VISION_DATA_DIR}/object-debug
+
+face_api:
+  enabled: false
+
+topics:
+  camera_image: /camera/camera/color/image_raw
+  visual_event: /perception/visual_event
+  object_detections: /perception/vision/object_detections
+  gesture_debug: /perception/vision/gesture_debug
+  enrollment_event: /perception/vision/enrollment_event
+  vision_task: /perception/vision/task
+  observation_rate_hz: 1.0
+  camera_stale_timeout_sec: 0.5
+  object_cache_timeout_sec: 2.5
+
+providers:
+  # Do not initialize YuNet, MediaPipe, HandLandmarker or ByteTrack.
+  vision:
+    type: observation
+    enabled: false
+    config: {}
+
+  object:
+    type: object_detector
+    enabled: true
+    config:
+      # Keep this identical to the production object detector for A/B tests.
+      object_model: ${MARSDOG_VISION_MODEL_DIR}/yoloe-26s-seg_rknn_model
+      image_size: 640
+      det_threshold: 0.2
+      nms_threshold: 0.2
+      max_detections: 50
+      # Dedicated debug launch intentionally starts a permanent 1 Hz stream.
+      inference_rate_hz: 1.0
+      on_demand_rate_hz: 2.0
+      max_inference_rate_hz: 5.0
+      default_lease_sec: 3.0
+      max_lease_sec: 30.0
+      scheduler_rate_hz: 20.0
+
+  # Do not initialize the standalone SFace provider either.
+  face_recognition:
+    type: sface
+    enabled: false
+    config: {}

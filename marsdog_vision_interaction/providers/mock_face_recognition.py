@@ -98,3 +98,7 @@ class MockFaceRecognitionProvider(BaseProvider):
 
         logger.debug("MockFaceRecognition recognized: id=%s", user_id)
         return {"user_id": user_id, "confidence": 0.90, "matched": True}
+
+    def clear_enrolled(self) -> None:
+        with self._lock:
+            self._enrolled.clear()

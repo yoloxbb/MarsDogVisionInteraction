@@ -12,11 +12,13 @@
 | `/camera/camera/color/image_raw` | `sensor_msgs/msg/Image` | BEST_EFFORT, KEEP_LAST 1 | RealSense | Vision、调试 Viewer |
 | `/camera/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | BEST_EFFORT, KEEP_LAST 1 | RealSense | 标定/调试消费者 |
 | `/perception/visual_event` | `std_msgs/msg/String` JSON | BEST_EFFORT, KEEP_LAST 5 | Vision | Behavior Tree、Action |
+| `/perception/vision/object_detections` | `std_msgs/msg/String` JSON v2 | BEST_EFFORT, KEEP_LAST 5 | Vision | Action、Viewer |
 | `/perception/vision/enrollment_event` | `std_msgs/msg/String` JSON | RELIABLE, KEEP_LAST 10 | Vision | 管理界面 |
 | `/perception/vision/task` | `marsdog_vision_interaction/srv/VisionTask` | Service | Vision | Behavior Tree、管理界面 |
-| `/emotion/state` | `std_msgs/msg/String` JSON | BEST_EFFORT, KEEP_LAST 5 | Emotion | Behavior Tree |
+| `/api/v1/faces...` | FastAPI multipart/JSON/JPEG | HTTP；暂不鉴权 | Vision | 本地人脸管理界面 |
+| `/emotion/state` | `std_msgs/msg/String` JSON v2 | RELIABLE, KEEP_LAST 10 | Emotion | Behavior Tree |
 | `/emotion/signal_event` | `std_msgs/msg/String` JSON | RELIABLE, KEEP_LAST 10 | Emotion | Behavior Tree |
-| `/internal_need/state` | `std_msgs/msg/String` JSON | BEST_EFFORT, KEEP_LAST 5 | InternalNeed | Behavior Tree |
+| `/internal_need/state` | `std_msgs/msg/String` JSON v2 | RELIABLE, KEEP_LAST 10 | InternalNeed | Behavior Tree |
 | `/internal_need/signal_event` | `std_msgs/msg/String` JSON | RELIABLE, KEEP_LAST 10 | InternalNeed | Behavior Tree |
 | `/behavior/attention_tracking` | `std_msgs/msg/String` JSON | RELIABLE, KEEP_LAST 10 | Behavior Tree | Action |
 | `/execute_behavior` | `marsdog_interfaces/action/ExecuteBehavior` | Action | Action Server | Behavior Tree Client |
@@ -89,6 +91,13 @@ latency_ms
 
 `String.data` 为 `schema_version=1` 的 JSON，默认 10 Hz：
 
+当前 30 Hz 相机输入使用 `inference_frame_stride=2`，完整人脸/姿态/手部流水线
+最高约 15 Hz；Topic 的 10 Hz 表示发布频率，不等同于模型推理频率。
+
+精确 GesturePose 标签和候选分数通过调试专用
+`/perception/vision/gesture_debug` 发布。行为树只消费本节定义的正式
+`/perception/visual_event`，不依赖调试 Topic。
+
 ```json
 {
   "schema_version": 1,
@@ -123,13 +132,58 @@ latency_ms
 坐标约束：
 
 - `x/y/w/h` 和中心坐标均相对“推理实际使用的画面”归一化到 `[0,1]`。
-- 当前 640×240 双目横拼输入只选择左目，推理画面为 320×240，因此左目中心仍为 `x=0.5`。
-- 单目 424×240 等非横拼宽高比输入不会被错误切半。
-- 消费者不应再按原始 640 像素宽度解释 `active_target` 坐标。
+- 当前为 RealSense 640×480 单目彩色流，完整画面参与推理，中心为 `x=0.5`。
+- 仅在显式开启双目模式且输入满足横拼宽高比时选择单眼画面。
+- Service 的人脸注册、识别与物体检测使用和连续感知相同的画面选择规则。
 
 目标有效条件：`tracking_state == "tracking"`、`track_id > 0` 且消息未超过消费者的视觉超时。Action 当前默认视觉超时为 0.8 秒。无有效目标时必须停止底盘。
 
 `speaker_id`、`is_speaking`、`speaker_confidence` 是旧兼容占位，视觉项目不填充跨模态信息。
+
+陌生人脸在 Vision 中始终产生 `EVT_VISION_STRANGER`。Vision 不订阅
+`/emotion/state` 或 `/internal_need/state`，也不产生 Alert/Friend 细分视觉事件。
+Behavior Tree 分别消费 `/perception/visual_event` 和 `/emotion/state`，在下游完成
+陌生人事实与情绪状态的组合判断、候选去重和行为选择。
+
+### 3.1 `/perception/vision/object_detections`
+
+正式配置以 `inference_rate_hz=0` 启动，不持续占用 RKNN。Action 通过
+`VisionTask.set_object_detection` 开启带 `session_id` 和租约的数据流；默认
+2 Hz、最大 5 Hz。视觉只发布检测数据，搜索、靠近、目标丢失处理和 `/cmd_vel`
+全部属于 Action。推理流与单次 Service 串行访问 RKNN，不会并发执行。
+
+```json
+{
+  "schema_version": 2,
+  "header": {"stamp": 1786417000.1, "frame_id": "camera_link"},
+  "published_at": 1786417000.2,
+  "sequence": 12,
+  "source": "stream",
+  "status": "ok",
+  "stream": {
+    "active": true,
+    "session_id": "find-object-001",
+    "rate_hz": 2.0,
+    "confidence": 0.25,
+    "target_labels": ["dog toy ball"],
+    "lease_remaining_sec": 2.7
+  },
+  "request": {
+    "target_labels": ["dog toy ball"],
+    "confidence": 0.25
+  },
+  "stop_reason": "",
+  "inference_latency_ms": 85.3,
+  "objects": [],
+  "error": ""
+}
+```
+
+`header.stamp` 对应实际推理相机帧，`published_at` 对应结果发布时间。
+`status=ok` 的空数组是有效的“未检测到物体”；`status=error` 时 Action 必须
+停止使用旧位置；显式停止或租约失效会发布 `source=control,status=stopped`，
+`stop_reason` 分别为 `requested` 或 `lease_expired`。Action 必须同时校验新鲜度、
+`source=stream`、`stream.session_id` 和递增 `sequence`，不能只依赖缓存框。
 
 ## 4. VoiceTask 与 VisionTask
 
@@ -166,15 +220,36 @@ float64 latency_ms
 | `task_type` | 主要参数 | 主要结果 |
 |---|---|---|
 | `check_person` | `{}` | `ok`, `present`, `count` |
-| `detect_objects` | 可选 `confidence` | `ok`, `objects[]` |
+| `detect_objects` | 可选 `confidence`, `target_labels[]` | `ok`, `objects[]`，单帧查询 |
+| `set_object_detection` | `enabled`, `session_id`; 开启时可选 `rate_hz`, `confidence`, `target_labels[]`, `lease_sec` | `ok`, `stream` |
+| `get_object_detection_state` | `{}` | `ok`, `stream` |
 | `recognize_face` | `{}` | `ok`, `user_id`, `confidence`, `matched` |
-| `start_face_enrollment` | `name`, `required_shots` | `ok`, `step`, `total_steps`, `prompt` |
+| `start_face_enrollment` | 固定 `name`, `required_shots`（默认 3，范围1～5） | `ok`, `step`, `total_steps`, `pose`, `prompt` |
 | `cancel_face_enrollment` | `{}` | `ok`, `cancelled` |
-| `upload_face` | `name`, `image_base64` | `ok`, `name`, `shots` |
+| `upload_face` | 固定 `name`, `image_base64` | `ok`, `name`, `shots`, `sample_id` |
 | `list_faces` | `{}` | `faces[]` |
+| `list_face_records` | `{}` | `count`, `allowed_names`, `available_names`, `faces[]` |
+| `list_face_samples` | `name` | `shots`, `sample_ids`, `samples[]` |
+| `get_face_sample` | `name`, `sample_id` | 单张图片元数据 |
+| `replace_face_sample` | `name`, `sample_id`, `image_base64` | `replaced=true` |
+| `delete_face_sample` | `name`, `sample_id` | `remaining_sample_ids`, `face_removed` |
 | `delete_face` | `name` | `ok` |
 
-`params_json` 必须是 JSON object。过渡期仍兼容 `[ {"key":"...","value":"..."} ]`。视觉节点当前 `latency_ms` 保留为默认值，消费者不能用它做硬实时判断。
+人脸固定身份为 `owner/family_member_1～4`，每个身份最多5张，稳定 `sample_id`
+为1～5。HTTP 样本 CRUD 见视觉项目 `README.md`；当前接口暂不鉴权，远程绑定仅限
+可信隔离局域网，生物数据只保存在视觉设备本地。
+
+`params_json` 必须是 JSON object。过渡期仍兼容 `[ {"key":"...","value":"..."} ]`。
+视觉节点测量并返回本次回调的 `latency_ms`；该值包括同步推理时间，但仍不能
+替代 Topic 新鲜度或下游硬实时超时判断。
+
+数据流或 Service 的 `detect_objects` 成功结果会在缓存有效期内镜像到
+`tracked_objects[]`；停止流会立即清空缓存。真实模型或相机不可用时会发布/返回
+失败，不会返回合成物体。目标标签是对 RKNN 已有类别的精确过滤，不会动态扩展
+开放词汇。
+
+姿态/手势事件使用关键点时序规则。`EVT_VISION_FALL` 需要直立基线、快速转变
+和持续躺卧，静态躺卧不会产生跌倒事件。
 
 ## 5. `/behavior/attention_tracking`
 

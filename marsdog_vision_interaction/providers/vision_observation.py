@@ -12,7 +12,10 @@ Total per frame: ~20ms, well within 100ms budget at 10Hz.
 
 from __future__ import annotations
 
+from collections import deque
+import copy
 import logging
+from pathlib import Path
 import threading
 import time
 from typing import Any
@@ -20,6 +23,13 @@ from typing import Any
 import numpy as np
 
 from marsdog_vision_interaction.providers.base import BaseProvider
+from marsdog_vision_interaction.providers.gesture_pose_engine import (
+    HandLandmarkSet,
+    PoseLandmarkSet,
+    hand_landmarks_from_objects,
+    pose_landmarks_from_objects,
+)
+from marsdog_vision_interaction.providers.pose_action import PoseActionClassifier
 from marsdog_vision_interaction.utils.stereo_view import select_camera_view
 
 logger = logging.getLogger(__name__)
@@ -31,7 +41,7 @@ class VisionObservationProvider(BaseProvider):
     """Continuous vision — YuNet face + MediaPipe pose + hands.
 
     Accepts camera frames from the bridge node via process_frame().
-    Runs detection on each frame, caches the result.
+    Runs detection according to ``inference_frame_stride`` and caches the result.
     get_observation() returns the latest cached dict.
     """
 
@@ -39,15 +49,90 @@ class VisionObservationProvider(BaseProvider):
         super().__init__(config)
 
         self._face_detect_model = config.get("face_detect_model", "")
-        self._mediapipe_model = config.get("mediapipe_model", "")
+        self._pose_model_variant = str(
+            config.get("pose_model_variant", "lite")
+        ).strip().lower()
+        pose_models = config.get("pose_models", {})
+        configured_pose_model = config.get("mediapipe_model", "")
+        if isinstance(pose_models, dict):
+            configured_pose_model = pose_models.get(
+                self._pose_model_variant,
+                configured_pose_model,
+            )
+        self._mediapipe_model = str(configured_pose_model or "")
+        if self._pose_model_variant not in {"lite", "full", "heavy"}:
+            self._pose_model_variant = self._infer_pose_model_variant(
+                self._mediapipe_model
+            )
+        self._landmarker_running_mode = str(
+            config.get("landmarker_running_mode", "video")
+        ).strip().lower()
+        if self._landmarker_running_mode not in {"image", "video"}:
+            logger.warning(
+                "Invalid landmarker_running_mode=%r; falling back to video",
+                self._landmarker_running_mode,
+            )
+            self._landmarker_running_mode = "video"
         self._hand_landmark_model = config.get(
             "hand_landmark_model",
-            "/home/cat/xbb/models/vision/hand_landmarker.task",
+            "models/vision/hand_landmarker.task",
         )
         self._det_threshold = float(config.get("det_threshold", 0.5))
         self._nms_threshold = float(config.get("nms_threshold", 0.45))
         self._pose_confidence_threshold = float(
             config.get("pose_confidence_threshold", 0.5),
+        )
+        self._max_num_poses = max(1, int(config.get("max_num_poses", 4)))
+        self._hand_idle_inference_stride = max(
+            1, int(config.get("hand_idle_inference_stride", 2))
+        )
+        self._hand_active_hold_inferences = max(
+            0, int(config.get("hand_active_hold_inferences", 8))
+        )
+        self._hand_schedule_counter = 0
+        self._hand_active_remaining = 0
+        self._hand_inference_count = 0
+        # A stride of 2 means frames 1, 3, 5... run the complete face/pose/hand
+        # pipeline while the frames in between are deliberately dropped.  The
+        # camera callback still receives every frame, so stream freshness is
+        # independent from inference load.
+        self._inference_frame_stride = max(
+            1, int(config.get("inference_frame_stride", 1))
+        )
+        self._received_frame_count = 0
+        self._inference_candidate_count = 0
+        self._inferred_frame_count = 0
+        self._replaced_pending_frame_count = 0
+        self._landmarker_timestamp_ms = 0
+        metric_window_size = max(
+            10, int(config.get("landmarker_metric_window_size", 150))
+        )
+        self._landmarker_times: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._pipeline_latency_ms: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._pose_latency_ms: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._hand_latency_ms: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._pose_detected: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._pose_keypoint_valid: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._pose_critical_valid: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._hand_detected: deque[float] = deque(
+            maxlen=metric_window_size
+        )
+        self._hand_landmarker_times: deque[float] = deque(
+            maxlen=metric_window_size
         )
 
         # Stereo fusion — single-target constraint for binocular cameras
@@ -82,25 +167,192 @@ class VisionObservationProvider(BaseProvider):
         self._face_rec_model: Any = None   # cv2.FaceRecognizerSF (for alignCrop + feature)
         self._use_byte_track: bool = bool(config.get("face_tracking", {}).get("use_bytetrack", True))
 
-        # Pose/Hand action classifier (mock — random low-frequency triggers)
-        from marsdog_vision_interaction.providers.pose_action import PoseActionClassifier
+        # One deterministic temporal GesturePose engine is retained per stable
+        # visual target ID.  Its defaults come from the standalone reference.
         self._action_classifier = PoseActionClassifier(
-            trigger_chance=float(config.get("action_trigger_chance", 0.003)),
-            min_duration_sec=float(config.get("action_min_duration_sec", 2.0)),
-            max_duration_sec=float(config.get("action_max_duration_sec", 4.0)),
-            min_cooldown_sec=float(config.get("action_min_cooldown_sec", 5.0)),
-            max_cooldown_sec=float(config.get("action_max_cooldown_sec", 15.0)),
+            window_size=int(config.get("action_window_size", 30)),
+            track_timeout_sec=float(config.get("action_track_timeout_sec", 3.0)),
         )
 
         # Cache
         self._lock = threading.Lock()
+        self._frame_condition = threading.Condition(self._lock)
         self._latest_frame: np.ndarray | None = None
+        self._pending_frame: np.ndarray | None = None
+        self._pending_frame_stamp: float = 0.0
+        self._pending_frame_id: str = "camera_link"
         self._cached_observation: dict[str, Any] = {}
-        self._processing = False
+        self._inference_lock = threading.RLock()
+        self._worker_stop = False
+        self._worker: threading.Thread | None = None
+
+    @staticmethod
+    def _infer_pose_model_variant(model_path: str) -> str:
+        name = Path(model_path).name.lower()
+        for variant in ("heavy", "full", "lite"):
+            if variant in name:
+                return variant
+        return "custom"
+
+    def _reset_landmarker_metrics(self) -> None:
+        self._landmarker_timestamp_ms = 0
+        for values in (
+            self._landmarker_times,
+            self._pipeline_latency_ms,
+            self._pose_latency_ms,
+            self._hand_latency_ms,
+            self._pose_detected,
+            self._pose_keypoint_valid,
+            self._pose_critical_valid,
+            self._hand_detected,
+            self._hand_landmarker_times,
+        ):
+            values.clear()
+        self._hand_schedule_counter = 0
+        self._hand_active_remaining = 0
+        self._hand_inference_count = 0
+
+    def _next_landmarker_timestamp(self) -> int:
+        timestamp_ms = time.monotonic_ns() // 1_000_000
+        if timestamp_ms <= self._landmarker_timestamp_ms:
+            timestamp_ms = self._landmarker_timestamp_ms + 1
+        self._landmarker_timestamp_ms = timestamp_ms
+        return timestamp_ms
+
+    def _run_landmarker(
+        self,
+        landmarker: Any,
+        image: Any,
+        timestamp_ms: int,
+    ) -> Any:
+        if self._landmarker_running_mode == "video":
+            return landmarker.detect_for_video(image, timestamp_ms)
+        return landmarker.detect(image)
+
+    @staticmethod
+    def _average(values: deque[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    @staticmethod
+    def _percentile(values: deque[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        return float(np.percentile(np.asarray(values), percentile))
+
+    def _landmarker_diagnostics(self) -> dict[str, Any]:
+        effective_fps = 0.0
+        if (
+            len(self._landmarker_times) >= 2
+            and self._landmarker_times[-1] > self._landmarker_times[0]
+        ):
+            effective_fps = (
+                (len(self._landmarker_times) - 1)
+                / (self._landmarker_times[-1] - self._landmarker_times[0])
+            )
+        hand_effective_fps = 0.0
+        if (
+            len(self._hand_landmarker_times) >= 2
+            and self._hand_landmarker_times[-1]
+            > self._hand_landmarker_times[0]
+        ):
+            hand_effective_fps = (
+                (len(self._hand_landmarker_times) - 1)
+                / (
+                    self._hand_landmarker_times[-1]
+                    - self._hand_landmarker_times[0]
+                )
+            )
+
+        def rounded(value: float | None) -> float | None:
+            return round(value, 3) if value is not None else None
+
+        return {
+            "pose_model_variant": self._pose_model_variant,
+            "pose_model_file": Path(self._mediapipe_model).name,
+            "running_mode": self._landmarker_running_mode,
+            "inference_frame_stride": self._inference_frame_stride,
+            "received_frames": self._received_frame_count,
+            "inference_candidates": self._inference_candidate_count,
+            "inferred_frames": self._inferred_frame_count,
+            "replaced_pending_frames": self._replaced_pending_frame_count,
+            "window_frames": len(self._landmarker_times),
+            "effective_inference_fps": round(effective_fps, 3),
+            "pipeline_avg_ms": rounded(
+                self._average(self._pipeline_latency_ms)
+            ),
+            "pipeline_p95_ms": rounded(
+                self._percentile(self._pipeline_latency_ms, 95.0)
+            ),
+            "pose": {
+                "avg_ms": rounded(self._average(self._pose_latency_ms)),
+                "p95_ms": rounded(
+                    self._percentile(self._pose_latency_ms, 95.0)
+                ),
+                "detection_rate": rounded(
+                    self._average(self._pose_detected)
+                ),
+                "keypoint_valid_ratio": rounded(
+                    self._average(self._pose_keypoint_valid)
+                ),
+                "critical_keypoint_valid_ratio": rounded(
+                    self._average(self._pose_critical_valid)
+                ),
+            },
+            "hand": {
+                "idle_inference_stride": self._hand_idle_inference_stride,
+                "inference_runs": self._hand_inference_count,
+                "effective_inference_fps": round(hand_effective_fps, 3),
+                "avg_ms": rounded(self._average(self._hand_latency_ms)),
+                "p95_ms": rounded(
+                    self._percentile(self._hand_latency_ms, 95.0)
+                ),
+                "detection_rate": rounded(
+                    self._average(self._hand_detected)
+                ),
+            },
+        }
+
+    def _record_pose_quality(self, humans: list[dict[str, Any]]) -> None:
+        if not humans:
+            self._pose_detected.append(0.0)
+            self._pose_keypoint_valid.append(0.0)
+            self._pose_critical_valid.append(0.0)
+            return
+        self._pose_detected.append(1.0)
+        best = max(
+            humans,
+            key=lambda human: float(human.get("confidence", 0.0)),
+        )
+        keypoints = {
+            int(point.get("id", -1)): point
+            for point in best.get("keypoints", [])
+            if isinstance(point, dict)
+        }
+
+        def valid(point: dict[str, Any] | None) -> bool:
+            if not point:
+                return False
+            return min(
+                float(point.get("confidence", 0.0)),
+                float(point.get("presence", 1.0)),
+            ) >= self._pose_confidence_threshold
+
+        all_valid = [valid(keypoints.get(index)) for index in range(33)]
+        critical_indices = (0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26)
+        critical_valid = [valid(keypoints.get(index)) for index in critical_indices]
+        self._pose_keypoint_valid.append(sum(all_valid) / len(all_valid))
+        self._pose_critical_valid.append(
+            sum(critical_valid) / len(critical_valid)
+        )
 
     # ── Lifecycle ──────────────────────────────────────────────
 
     def start(self) -> None:
+        self._received_frame_count = 0
+        self._inference_candidate_count = 0
+        self._inferred_frame_count = 0
+        self._replaced_pending_frame_count = 0
+        self._reset_landmarker_metrics()
         try:
             import cv2
 
@@ -132,12 +384,17 @@ class VisionObservationProvider(BaseProvider):
                     from mediapipe.tasks.python import vision
                     from mediapipe.tasks.python.vision import RunningMode
 
+                    running_mode = (
+                        RunningMode.VIDEO
+                        if self._landmarker_running_mode == "video"
+                        else RunningMode.IMAGE
+                    )
                     options = vision.PoseLandmarkerOptions(
                         base_options=mp.tasks.BaseOptions(
                             model_asset_path=self._mediapipe_model,
                         ),
-                        running_mode=RunningMode.IMAGE,
-                        num_poses=5,
+                        running_mode=running_mode,
+                        num_poses=self._max_num_poses,
                         min_pose_detection_confidence=self._det_threshold,
                         min_pose_presence_confidence=self._det_threshold,
                         min_tracking_confidence=0.5,
@@ -146,7 +403,12 @@ class VisionObservationProvider(BaseProvider):
                         options,
                     )
                     loaded += 1
-                    logger.info("MediaPipe PoseLandmarker loaded: %s", self._mediapipe_model)
+                    logger.info(
+                        "MediaPipe PoseLandmarker loaded: variant=%s mode=%s model=%s",
+                        self._pose_model_variant,
+                        self._landmarker_running_mode,
+                        self._mediapipe_model,
+                    )
                 except Exception as exc:
                     logger.warning("MediaPipe PoseLandmarker failed: %s", exc)
             else:
@@ -159,11 +421,16 @@ class VisionObservationProvider(BaseProvider):
                     from mediapipe.tasks.python import vision
                     from mediapipe.tasks.python.vision import RunningMode
 
+                    running_mode = (
+                        RunningMode.VIDEO
+                        if self._landmarker_running_mode == "video"
+                        else RunningMode.IMAGE
+                    )
                     hand_options = vision.HandLandmarkerOptions(
                         base_options=mp.tasks.BaseOptions(
                             model_asset_path=self._hand_landmark_model,
                         ),
-                        running_mode=RunningMode.IMAGE,
+                        running_mode=running_mode,
                         num_hands=2,
                         min_hand_detection_confidence=0.5,
                         min_hand_presence_confidence=0.5,
@@ -173,7 +440,11 @@ class VisionObservationProvider(BaseProvider):
                         hand_options,
                     )
                     loaded += 1
-                    logger.info("MediaPipe HandLandmarker loaded: %s", self._hand_landmark_model)
+                    logger.info(
+                        "MediaPipe HandLandmarker loaded: mode=%s model=%s",
+                        self._landmarker_running_mode,
+                        self._hand_landmark_model,
+                    )
                 except Exception as exc:
                     logger.warning("MediaPipe HandLandmarker failed: %s", exc)
             else:
@@ -224,9 +495,16 @@ class VisionObservationProvider(BaseProvider):
 
             if loaded > 0:
                 self.available = True
+                self._start_inference_worker()
                 logger.info(
-                    "VisionObservationProvider started — %d/%d models loaded",
-                    loaded, total,
+                    "VisionObservationProvider started — %d/%d models loaded; "
+                    "inference_frame_stride=%d; max_num_poses=%d; "
+                    "hand_idle_stride=%d; latest-frame worker=enabled",
+                    loaded,
+                    total,
+                    self._inference_frame_stride,
+                    self._max_num_poses,
+                    self._hand_idle_inference_stride,
                 )
             else:
                 self.available = False
@@ -237,6 +515,14 @@ class VisionObservationProvider(BaseProvider):
             logger.warning("VisionObservationProvider start failed: %s", exc, exc_info=True)
 
     def stop(self) -> None:
+        self.available = False
+        if not self._stop_inference_worker():
+            logger.error(
+                "Inference worker did not stop; leaving model handles intact "
+                "to avoid closing them during an active inference"
+            )
+            return
+        self._action_classifier.reset()
         self._face_detector = None
         self._face_tracker = None
         self._face_rec_throttle = None
@@ -255,29 +541,107 @@ class VisionObservationProvider(BaseProvider):
             self._hand_landmarker = None
         with self._lock:
             self._latest_frame = None
+            self._pending_frame = None
             self._cached_observation = {}
-        self.available = False
+        self._received_frame_count = 0
+        self._inference_candidate_count = 0
+        self._inferred_frame_count = 0
+        self._replaced_pending_frame_count = 0
+        self._reset_landmarker_metrics()
         logger.info("VisionObservationProvider stopped")
 
     # ── Frame injection ────────────────────────────────────────
 
-    def process_frame(self, frame: np.ndarray) -> None:
-        """Accept a camera frame — crop to left half, detect, feed TargetManager."""
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        *,
+        stamp: float = 0.0,
+        frame_id: str = "camera_link",
+    ) -> None:
+        """Queue only the newest eligible frame for the inference worker.
+
+        The ROS camera callback must stay short: while inference is busy, a
+        newer eligible frame replaces the single pending frame instead of
+        building latency in a FIFO queue.
+        """
         if not self.available:
             return
-        if self._processing:
-            return
+        with self._frame_condition:
+            self._received_frame_count += 1
+            if (self._received_frame_count - 1) % self._inference_frame_stride:
+                return
+            self._inference_candidate_count += 1
+            if self._pending_frame is not None:
+                self._replaced_pending_frame_count += 1
+            self._pending_frame = frame
+            self._pending_frame_stamp = float(stamp or time.time())
+            self._pending_frame_id = str(frame_id or "camera_link")
+            self._frame_condition.notify()
 
-        self._processing = True
-        try:
-            self._latest_frame = frame
-            obs = self._process_frame_impl(frame)
-            with self._lock:
-                self._cached_observation = obs
-        except Exception as exc:
-            logger.error("Frame processing error: %s", exc, exc_info=True)
-        finally:
-            self._processing = False
+    def _start_inference_worker(self) -> None:
+        with self._frame_condition:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker_stop = False
+            self._pending_frame = None
+            self._pending_frame_stamp = 0.0
+            self._pending_frame_id = "camera_link"
+            self._worker = threading.Thread(
+                target=self._inference_worker_loop,
+                name="vision-latest-frame-inference",
+                daemon=True,
+            )
+            self._worker.start()
+
+    def _stop_inference_worker(self) -> bool:
+        with self._frame_condition:
+            self._worker_stop = True
+            self._pending_frame = None
+            self._pending_frame_stamp = 0.0
+            self._frame_condition.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=5.0)
+        stopped = worker is None or not worker.is_alive()
+        if stopped:
+            with self._frame_condition:
+                self._worker = None
+        return stopped
+
+    def _inference_worker_loop(self) -> None:
+        while True:
+            with self._frame_condition:
+                self._frame_condition.wait_for(
+                    lambda: self._worker_stop or self._pending_frame is not None
+                )
+                if self._worker_stop:
+                    return
+                frame = self._pending_frame
+                frame_stamp = self._pending_frame_stamp
+                frame_id = self._pending_frame_id
+                self._pending_frame = None
+                self._pending_frame_stamp = 0.0
+            if frame is None:
+                continue
+            try:
+                with self._inference_lock:
+                    obs = self._process_frame_impl(frame)
+                obs["header"] = {
+                    "stamp": float(frame_stamp or time.time()),
+                    "frame_id": str(frame_id or "camera_link"),
+                }
+                with self._lock:
+                    self._latest_frame = frame
+                    self._cached_observation = obs
+                    self._inferred_frame_count += 1
+            except Exception as exc:
+                logger.error("Frame processing error: %s", exc, exc_info=True)
+
+    def run_inference_exclusive(self, operation: Any) -> Any:
+        """Run an operation while the shared YuNet/SFace models are idle."""
+        with self._inference_lock:
+            return operation()
 
     def _process_frame_impl(self, frame: np.ndarray) -> dict[str, Any]:
         """Select one stereo eye and run all 2D models on that view.
@@ -314,18 +678,8 @@ class VisionObservationProvider(BaseProvider):
                 self._last_input_layout = layout
             obs = self._run_inference(selected_frame, detect_faces=True)
 
-        # ── Pose/Hand action classifier update ──────────────
-        self._action_classifier.update()
-        pose_key, pose_label = self._action_classifier.pose_action
-        hand_key, hand_label = self._action_classifier.hand_action
-
-        # Pose actions belong to the detected human. Attach them before target
-        # selection so they survive into ActiveTarget and downstream events.
-        for human in obs.get("humans", []):
-            human["pose_action"] = pose_key
-            human["pose_action_label"] = pose_label
-
-        # Feed to TargetManager for single-target selection
+        # Feed every body into the process-wide tracker.  The manager retains a
+        # legacy active target but exposes all tracks for downstream policy.
         from marsdog_vision_interaction.fusion.stereo_fusion import get_target_manager
 
         mgr = get_target_manager()
@@ -333,9 +687,47 @@ class VisionObservationProvider(BaseProvider):
             humans=obs.get("humans", []),
             faces=obs.get("faces", []),
         )
-        active = mgr.get_active_target()
+        target_snapshot = mgr.get_snapshot()
+        active = target_snapshot["active_target"]
         active_dict = active.to_dict()
+        human_candidates = target_snapshot["human_candidates"]
         target_is_current = active_dict["tracking_state"] == "tracking"
+
+        # Run the temporal action engine only for the human selected by the
+        # stable target manager.  Hand-to-person association is not available
+        # from MediaPipe Tasks, so hands are used only in single-target mode.
+        target_human = self._match_active_human(active.bbox, obs.get("humans", []))
+        pose_landmarks = (
+            target_human.get("_behavior_landmarks")
+            if target_human is not None and target_is_current
+            else None
+        )
+        left_hand, right_hand = self._behavior_hands(obs.get("hands", []))
+        action_result = self._action_classifier.update(
+            track_id=active.track_id if active.track_id > 0 else 0,
+            pose_landmarks=pose_landmarks,
+            left_hand=left_hand if pose_landmarks is not None else None,
+            right_hand=right_hand if pose_landmarks is not None else None,
+            face_observed=(
+                bool(active.face_confidence > 0.0 and target_is_current)
+                if self.task_face_enabled
+                else None
+            ),
+            now=time.monotonic(),
+        )
+        action_result["landmarker"] = obs.get(
+            "_landmarker_diagnostics", {}
+        )
+        pose_key = str(action_result.get("pose_action", ""))
+        pose_label = str(action_result.get("pose_action_label", ""))
+        hand_key = str(action_result.get("hand_action", ""))
+        hand_label = str(action_result.get("hand_action_label", ""))
+        active_dict["pose_action"] = pose_key
+        active_dict["pose_action_label"] = pose_label
+        for candidate in human_candidates:
+            if candidate.get("target_id") == active.target_id:
+                candidate["pose_action"] = pose_key
+                candidate["pose_action_label"] = pose_label
 
         # Build unified output (matches the bridge's expected format)
         humans_out = []
@@ -398,12 +790,51 @@ class VisionObservationProvider(BaseProvider):
             })
 
         return {
+            "vision_epoch": target_snapshot["vision_epoch"],
             "active_target": active_dict,
+            "human_candidates": human_candidates,
             "faces": faces_out,
             "humans": humans_out,
             "hands": hands_out,
             "tracked_objects": obs.get("tracked_objects", []),
+            "_gesture_diagnostics": action_result,
         }
+
+    @staticmethod
+    def _match_active_human(
+        active_bbox: tuple[float, float, float, float],
+        humans: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if not humans or active_bbox[2] <= 0.0 or active_bbox[3] <= 0.0:
+            return None
+
+        def distance(human: dict[str, Any]) -> float:
+            bbox = (
+                float(human.get("x", 0.0)),
+                float(human.get("y", 0.0)),
+                float(human.get("w", 0.0)),
+                float(human.get("h", 0.0)),
+            )
+            return sum((first - second) ** 2 for first, second in zip(active_bbox, bbox))
+
+        return min(humans, key=distance)
+
+    @staticmethod
+    def _behavior_hands(
+        hands: list[dict[str, Any]],
+    ) -> tuple[HandLandmarkSet | None, HandLandmarkSet | None]:
+        left: HandLandmarkSet | None = None
+        right: HandLandmarkSet | None = None
+        for hand in hands:
+            landmarks = hand.get("_behavior_landmarks")
+            if not isinstance(landmarks, tuple):
+                continue
+            side = str(hand.get("handedness", "")).strip().lower()
+            if side == "left" and left is None:
+                left = landmarks
+            elif side == "right" and right is None:
+                right = landmarks
+        return left, right
 
     @staticmethod
     def _select_stereo_view(
@@ -453,11 +884,25 @@ class VisionObservationProvider(BaseProvider):
     def get_observation(self) -> dict[str, Any]:
         with self._lock:
             if self._cached_observation:
-                return dict(self._cached_observation)
+                return copy.deepcopy(self._cached_observation)
         return {}
 
     def check_person(self) -> dict[str, Any]:
         obs = self.get_observation()
+        candidates = [
+            item
+            for item in obs.get("human_candidates", [])
+            if isinstance(item, dict)
+            and item.get("tracking_state") == "tracking"
+        ]
+        if candidates:
+            active = obs.get("active_target", {})
+            return {
+                "present": True,
+                "count": len(candidates),
+                "identity": str(active.get("identity", "unknown")),
+                "target": dict(active) if isinstance(active, dict) else {},
+            }
         humans = obs.get("humans", [])
         return {"present": len(humans) > 0, "count": len(humans)}
 
@@ -484,17 +929,60 @@ class VisionObservationProvider(BaseProvider):
         Caller is responsible for mapping to full-frame space if needed.
         """
         h, w = frame.shape[:2]
-
+        started_at = time.perf_counter()
+        timestamp_ms = self._next_landmarker_timestamp()
         faces = self._detect_faces(frame, w, h) if (detect_faces and self.task_face_enabled) else []
-        humans = self._detect_pose_mediapipe(frame, w, h) if self.task_pose_enabled else []
-        hands = self._detect_hands(frame, w, h) if self.task_hand_enabled else []
+        pose_started_at = time.perf_counter()
+        humans = (
+            self._detect_pose_mediapipe(frame, w, h, timestamp_ms)
+            if self.task_pose_enabled
+            else []
+        )
+        pose_ms = (time.perf_counter() - pose_started_at) * 1000.0
+        run_hands = (
+            self.task_hand_enabled
+            and self._hand_landmarker is not None
+            and self._hand_inference_is_due()
+        )
+        hands: list[dict[str, Any]] = []
+        hand_ms: float | None = None
+        if run_hands:
+            hand_started_at = time.perf_counter()
+            hands = self._detect_hands(frame, w, h, timestamp_ms)
+            hand_ms = (time.perf_counter() - hand_started_at) * 1000.0
+            self._hand_inference_count += 1
+            self._hand_landmarker_times.append(time.monotonic())
+            if hands:
+                self._hand_active_remaining = self._hand_active_hold_inferences
+            elif self._hand_active_remaining > 0:
+                self._hand_active_remaining -= 1
+        pipeline_ms = (time.perf_counter() - started_at) * 1000.0
+        self._landmarker_times.append(time.monotonic())
+        if self.task_pose_enabled and self._pose_landmarker is not None:
+            self._pose_latency_ms.append(pose_ms)
+            self._record_pose_quality(humans)
+        if hand_ms is not None:
+            self._hand_latency_ms.append(hand_ms)
+            self._hand_detected.append(1.0 if hands else 0.0)
+        self._pipeline_latency_ms.append(pipeline_ms)
 
         return {
             "faces": faces,
             "humans": humans,
             "hands": hands,
             "tracked_objects": [],
+            "_landmarker_diagnostics": self._landmarker_diagnostics(),
         }
+
+    def _hand_inference_is_due(self) -> bool:
+        self._hand_schedule_counter += 1
+        if self._hand_active_remaining > 0:
+            return True
+        return (
+            (self._hand_schedule_counter - 1)
+            % self._hand_idle_inference_stride
+            == 0
+        )
 
     # ── YuNet face detection ───────────────────────────────────
 
@@ -652,11 +1140,12 @@ class VisionObservationProvider(BaseProvider):
             # Compare against enrolled embeddings
             best_name = "unknown"
             best_score = 0.0
-            for name, emb in self._face_rec_throttle._enrolled_embeddings.items():
-                score = self._cosine_sim(feature, emb)
-                if score > best_score:
-                    best_score = score
-                    best_name = name
+            for name, templates in self._face_rec_throttle._enrolled_embeddings.items():
+                for emb in templates:
+                    score = self._cosine_sim(feature, emb)
+                    if score > best_score:
+                        best_score = score
+                        best_name = name
 
             threshold = self._face_rec_throttle._cosine_threshold
             if best_score >= threshold:
@@ -679,11 +1168,15 @@ class VisionObservationProvider(BaseProvider):
         """Copy enrolled embeddings from FaceRecognitionProvider to throttle."""
         if self._face_rec_throttle is None:
             return
+        with self._inference_lock:
+            self._sync_enrolled_to_throttle_locked()
+
+    def _sync_enrolled_to_throttle_locked(self) -> None:
         try:
             from marsdog_vision_interaction.core.face_enrollment_manager import EnrollmentManager
             import cv2
             names = EnrollmentManager.list_enrolled_faces()
-            enrolled: dict[str, np.ndarray] = {}
+            enrolled: dict[str, list[np.ndarray]] = {}
             for name in names:
                 paths = EnrollmentManager.get_face_paths(name)
                 for p_str in paths:
@@ -695,8 +1188,7 @@ class VisionObservationProvider(BaseProvider):
                         continue
                     feature = self._face_rec_model.feature(img)
                     if feature is not None:
-                        enrolled[name] = feature.ravel()
-                        break  # one embedding per person
+                        enrolled.setdefault(name, []).append(feature.ravel())
             self._face_rec_throttle.set_enrolled_embeddings(enrolled)
             if enrolled:
                 logger.info("Throttle synced: %d enrolled faces", len(enrolled))
@@ -706,7 +1198,11 @@ class VisionObservationProvider(BaseProvider):
     # ── MediaPipe PoseLandmarker ───────────────────────────────
 
     def _detect_pose_mediapipe(
-        self, frame: np.ndarray, w: int, h: int,
+        self,
+        frame: np.ndarray,
+        w: int,
+        h: int,
+        timestamp_ms: int,
     ) -> list[dict[str, Any]]:
         """Run MediaPipe PoseLandmarker — combined human detection + 33-point pose.
 
@@ -727,7 +1223,11 @@ class VisionObservationProvider(BaseProvider):
                 data=rgb,
             )
 
-            result = self._pose_landmarker.detect(mp_image)
+            result = self._run_landmarker(
+                self._pose_landmarker,
+                mp_image,
+                timestamp_ms,
+            )
 
             if not result.pose_landmarks:
                 return []
@@ -762,7 +1262,9 @@ class VisionObservationProvider(BaseProvider):
                         "id": i,
                         "x": round(float(lm.x), 4),
                         "y": round(float(lm.y), 4),
+                        "z": round(float(lm.z), 4),
                         "confidence": round(float(lm.visibility), 4),
+                        "presence": round(float(getattr(lm, "presence", 1.0)), 4),
                     })
 
                 # Classify pose state from key landmarks
@@ -776,6 +1278,7 @@ class VisionObservationProvider(BaseProvider):
                     "confidence": round(float(avg_vis), 4),
                     "pose_state": pose_state,
                     "keypoints": keypoints,
+                    "_behavior_landmarks": pose_landmarks_from_objects(landmarks),
                 })
 
             return humans
@@ -787,7 +1290,11 @@ class VisionObservationProvider(BaseProvider):
     # ── MediaPipe HandLandmarker ──────────────────────────────
 
     def _detect_hands(
-        self, frame: np.ndarray, w: int, h: int,
+        self,
+        frame: np.ndarray,
+        w: int,
+        h: int,
+        timestamp_ms: int,
     ) -> list[dict[str, Any]]:
         """Run MediaPipe HandLandmarker — 21-point hand keypoints.
 
@@ -809,7 +1316,11 @@ class VisionObservationProvider(BaseProvider):
                 data=rgb,
             )
 
-            result = self._hand_landmarker.detect(mp_image)
+            result = self._run_landmarker(
+                self._hand_landmarker,
+                mp_image,
+                timestamp_ms,
+            )
 
             if not result.hand_landmarks:
                 return []
@@ -833,12 +1344,14 @@ class VisionObservationProvider(BaseProvider):
                         "id": j,
                         "x": round(float(lm.x), 4),
                         "y": round(float(lm.y), 4),
+                        "z": round(float(lm.z), 4),
                     })
 
                 if hand_landmarks:
                     hands.append({
                         "handedness": handedness,
                         "landmarks": hand_landmarks,
+                        "_behavior_landmarks": hand_landmarks_from_objects(landmarks),
                     })
 
             return hands

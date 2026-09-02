@@ -24,7 +24,14 @@ def _candidate_python() -> Path | None:
 
     # Support ``ros2 launch`` after sourcing the ROS workspace even when the
     # uv virtual environment was not explicitly activated.
-    anchors = (Path.cwd(), Path(__file__).resolve())
+    # With ``colcon build --symlink-install`` the installed executable points
+    # back into the source checkout.  Resolve argv[0] so a launch started from
+    # any working directory can still find that checkout's virtualenv.
+    anchors = (
+        Path.cwd(),
+        Path(sys.argv[0]).resolve(),
+        Path(__file__).resolve(),
+    )
     checked: set[Path] = set()
     for anchor in anchors:
         for parent in (anchor, *anchor.parents):

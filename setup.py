@@ -7,15 +7,21 @@ package_name = "marsdog_vision_interaction"
 
 setup(
     name=package_name,
-    version="0.1.0",
+    version="0.1.1",
     packages=find_packages(exclude=["tests"]),
+    package_data={package_name: ["web/*.html"]},
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/config", glob("config/*.yaml")),
         ("share/" + package_name + "/launch", glob("launch/*.py")),
     ],
-    install_requires=["setuptools"],
+    install_requires=[
+        "setuptools",
+        "fastapi>=0.115,<1",
+        "python-multipart>=0.0.9,<1",
+        "uvicorn>=0.30,<1",
+    ],
     zip_safe=True,
     maintainer="MarsDog Vision Team",
     maintainer_email="noreply@marsdog.dev",

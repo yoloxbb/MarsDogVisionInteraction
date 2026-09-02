@@ -1,4 +1,4 @@
-"""Camera driver node — sole owner of /dev/video0.
+"""Camera driver node — sole owner of one OpenCV video source.
 
 Publishes raw image streams for downstream subscribers (vision, navigation, app).
 No AI processing, no image duplication, non-blocking publish loop.
@@ -8,7 +8,7 @@ Topics:
   /camera/camera_info (sensor_msgs/CameraInfo)
 
 Parameters:
-  device:             Video device path (default /dev/video0)
+  device:             Video index or device path (default 0)
   width:              Capture width (default 640)
   height:             Capture height (default 480)
   fps:                Target FPS (default 30)
@@ -40,6 +40,12 @@ _CAMERA_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=1,
 )
+
+
+def _video_capture_source(value: str) -> int | str:
+    """Use portable numeric camera indexes while retaining path overrides."""
+    normalized = value.strip()
+    return int(normalized) if normalized.isdecimal() else normalized
 
 
 def _make_camera_info(frame_id: str, width: int, height: int) -> CameraInfo:
@@ -83,7 +89,7 @@ class CameraDriverNode(Node):
         setup_logging(log_dir="log", level="INFO", node="camera_driver")
 
         # ── Parameters ─────────────────────────────────────────
-        self.declare_parameter("device", "/dev/video0")
+        self.declare_parameter("device", "0")
         self.declare_parameter("width", 640)
         self.declare_parameter("height", 480)
         self.declare_parameter("fps", 30)
@@ -155,12 +161,13 @@ class CameraDriverNode(Node):
         Tries multiple FourCC codes in order of preference.
         """
         # Use V4L2 CAP_V4L2 for direct kernel access (lower latency)
-        self._cap = cv2.VideoCapture(self._device, cv2.CAP_V4L2)
+        source = _video_capture_source(self._device)
+        self._cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
 
         if not self._cap.isOpened():
             # Fallback: let OpenCV auto-detect backend
             logger.warning("V4L2 open failed, trying auto-detect")
-            self._cap = cv2.VideoCapture(self._device)
+            self._cap = cv2.VideoCapture(source)
 
         if not self._cap.isOpened():
             self.get_logger().error(f"Cannot open camera: {self._device}")

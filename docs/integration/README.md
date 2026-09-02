@@ -1,8 +1,8 @@
 # MarsDog 多项目对接归档
 
-> 归档版本：`1.0.0`
+> 归档版本：`1.3.4`
 >
-> 基线日期：`2026-08-04`
+> 基线日期：`2026-09-02`
 >
 > 适用项目：语音、视觉、行为树、动作执行器
 
@@ -14,13 +14,15 @@
 麦克风/唤醒板 ──> Voice ── /perception/audio_event ───────┐
                                                           │
 摄像头 ──> Vision ── /perception/visual_event ───────┐    │
-                    /perception/vision/task <─────┐   │    │
-                                                  │   ▼    ▼
+                    /perception/vision/task <───────────────┐
+                    /object_detections ──────────────────┐  │
+                                                  │   ▼  ▼  ▼
 Emotion/InternalNeed ── state + signal_event ──> Behavior Tree
                                                      │
                      /behavior/attention_tracking ───┼────────┐
                      /execute_behavior Action ───────┘        ▼
                                                        Action Executor
+                                                   (物体流会话所有者)
                                                              │
                                    /cmd_vel、Nav2、仿真/动作控制器
 
@@ -31,7 +33,9 @@ Action Result ──> Behavior Tree ── /behavior/result_event ──> Intern
 
 - 语音项目只负责听见什么、识别出什么意图以及会话何时结束，不直接控制底盘。
 - 视觉项目只发布视觉事实和稳定目标，不决定执行哪个行为。
-- 行为树项目负责事件映射、优先级、延迟队列、抢占、超时和会话跟踪模式。
+- 视觉对陌生人只发布 `EVT_VISION_STRANGER`，不订阅情绪或内部需求状态。
+- 行为树项目负责把陌生人视觉事实与情绪状态组合，并负责事件映射、优先级、延迟
+  队列、抢占、超时和会话跟踪模式。
 - 动作系统只接受语义 `behavior_name`，解析为 `ACT_*`，并控制 AGV/Nav2/仿真。
 - `/behavior/result_event` 由行为树发布，不由动作系统直接发布；行为树会把 Action Result 转成内部需求系统需要的数据。
 
@@ -39,11 +43,11 @@ Action Result ──> Behavior Tree ── /behavior/result_event ──> Intern
 
 | 子系统 | 负责人 | 仓库 | 交接文档 | 对外主接口 |
 |---|---|---|---|---|
-| 语音 | 待填写 | `/home/cat/xbb/MarsDogVoiceInteraction` | `docs/HANDOFF.md` | `/perception/audio_event`、`/perception/voice/task` |
-| 视觉 | 待填写 | `/home/cat/xbb/MarsDogVisionInteraction` | `docs/HANDOFF.md` | `/perception/visual_event`、`/perception/vision/task` |
-| 行为树 | 待填写 | `/home/cat/xbb/20260702_MarsDogTree` | `docs/HANDOFF.md` | `/execute_behavior` Client、`/behavior/result_event` |
-| 动作 | 待填写 | `/home/cat/xbb/20260707_MarsDogAction` | `docs/HANDOFF.md` | `/execute_behavior` Server、`/cmd_vel` |
-| 公共 Action 接口 | 待填写 | `/home/cat/xbb/marsdog_interfaces` | `action/ExecuteBehavior.action` | `marsdog_interfaces/action/ExecuteBehavior` |
+| 语音 | 待填写 | `MarsDogVoiceInteraction` | `docs/HANDOFF.md` | `/perception/audio_event`、`/perception/voice/task` |
+| 视觉 | 待填写 | `MarsDogVisionInteraction` | `docs/HANDOFF.md` | `/perception/visual_event`、`/perception/vision/object_detections`、`/perception/vision/task` |
+| 行为树 | 待填写 | `MarsDogTree` | `docs/HANDOFF.md` | `/execute_behavior` Client、`/behavior/result_event` |
+| 动作 | 待填写 | `MarsDogAction` | `docs/HANDOFF.md` | `/execute_behavior` Server、`/cmd_vel` |
+| 公共 Action 接口 | 待填写 | `marsdog_interfaces` | `action/ExecuteBehavior.action` | `marsdog_interfaces/action/ExecuteBehavior` |
 
 确定人员后应立即补齐负责人和联系方式；跨项目接口变更由生产者与所有直接消费者共同评审。
 
@@ -98,3 +102,4 @@ Action Result ──> Behavior Tree ── /behavior/result_event ──> Intern
 - 跟随是会话级闭环控制，不是预录制的前进/摆动动作。
 - 视觉数据超时或目标丢失时，动作系统必须发布零速度。
 - 同一时刻只能有一个底盘速度控制链路生效；Action 执行期间会暂停后台视觉跟踪。
+- 物体识别数据流由动作系统按 session 租用；视觉节点不参与搜索、接近或停车决策。
