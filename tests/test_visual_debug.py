@@ -347,6 +347,13 @@ def test_object_only_config_disables_non_object_models() -> None:
     assert production["providers"]["object"]["config"][
         "inference_rate_hz"
     ] == 0.0
+    assert production["providers"]["object"]["config"][
+        "held_pose_enabled"
+    ] is True
+    assert production["providers"]["object"]["config"][
+        "held_pose_rate_hz"
+    ] == 2.0
+    assert providers["object"]["config"]["held_pose_enabled"] is False
     for key in (
         "object_model",
         "image_size",

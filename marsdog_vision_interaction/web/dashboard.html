@@ -288,7 +288,47 @@
     const byId = id => document.getElementById(id);
     const text = value => value === undefined || value === null || value === '' ? '—' : String(value);
     const fixed = (value, digits = 2) => Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : '—';
+    const optionalFixed = (value, digits = 2) => value === undefined || value === null || value === '' ? '—' : fixed(value, digits);
     const percent = value => Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(1)}%` : '—';
+    const heldRejectionLabels = {
+      not_evaluated: '尚未获得新的物体推理结果',
+      missing_target: '没有当前人物目标',
+      target_not_tracking: '当前人物不在 tracking 状态',
+      object_not_detected: '未检出支持的玩具/狗粮物体',
+      unsupported_label: '物体标签不在手持白名单',
+      low_confidence: '物体置信度低于阈值',
+      invalid_human_bbox: '人物框无效',
+      no_valid_wrist: '当前人物框内没有有效手腕',
+      invalid_object_fields: '物体检测字段无效',
+      invalid_object_bbox: '物体框无效',
+      stale_object_sequence: '物体结果序号已过期',
+      object_track_not_current: '物体跟踪已丢失',
+      timestamp_mismatch: 'Pose 与物体源帧时间差过大',
+      wrist_too_far: '物体框距最近手腕过远',
+    };
+    const jumpModeLabels = {
+      full_body: '全身·髋部+脚踝',
+      upper_body_fallback: '半身兜底·肩部+髋部+回落',
+      unavailable: '关键点不足',
+    };
+    const jumpPhaseLabels = {
+      monitoring: '监测中',
+      takeoff_candidate: '正在累计起跳',
+      awaiting_return: '等待回落确认',
+      active: '已确认并保持',
+      cooldown: '重触发冷却',
+    };
+    const jumpRejectionLabels = {
+      pose_not_detected: '未检出Pose',
+      insufficient_upper_body: '肩部或髋部关键点不足',
+      full_body_motion_insufficient: '髋部和脚踝共同上升不足',
+      upper_body_motion_insufficient: '肩髋同步上升不足',
+      baseline_not_ready: '起跳前稳定基线不足',
+      collecting_takeoff: '正在累计起跳证据',
+      awaiting_return: '已确认上升，等待回落',
+      return_not_observed: '规定时间内未看到回落',
+      cooldown: '跳跃重触发冷却中',
+    };
     const objectDebugSession = 'vision-debug-web';
     let latestEventExport = {active_events: [], history: []};
     let objectLeaseTimer = null;
@@ -598,11 +638,12 @@
         const objectStream = task.stream || {};
         const objectActive = objectStream.active === true;
         const objectDebugActive = objectActive && objectStream.session_id === objectDebugSession;
+        const objectHoldingActive = objectActive && objectStream.session_id === 'vision-human-holding';
         const objectStopped = String(task.status || '').includes('stopped');
         const objectOneShotOk = task.success === true && String(task.status || '') === 'topic ok';
         byId('objectBadge').className = 'badge ' + (task.success === true && (objectActive || objectOneShotOk) ? 'ok' : task.pending || task.success == null || objectStopped ? 'warn' : 'bad');
-        byId('objectBadge').textContent = `物体识别：${task.pending ? '识别中' : objectActive ? `${text(objectStream.session_id)} · ${fixed(task.latency_ms, 0)} ms` : objectOneShotOk ? `单次完成 · ${fixed(task.latency_ms, 0)} ms` : objectStopped ? `已停止 (${text(task.stop_reason)})` : '等待手动或任务触发'}`;
-        byId('startObjectStream').disabled = objectControlPending || (objectActive && !objectDebugActive);
+        byId('objectBadge').textContent = `物体识别：${task.pending ? '识别中' : objectHoldingActive ? `自动手持判断 · ${fixed(task.latency_ms, 0)} ms` : objectActive ? `${text(objectStream.session_id)} · ${fixed(task.latency_ms, 0)} ms` : objectOneShotOk ? `单次完成 · ${fixed(task.latency_ms, 0)} ms` : objectStopped ? `已停止 (${text(task.stop_reason)})` : '等待人物或任务触发'}`;
+        byId('startObjectStream').disabled = objectControlPending || (objectActive && !objectDebugActive && !objectHoldingActive);
         byId('stopObjectStream').disabled = objectControlPending || !(objectDebugActive || objectDebugDesired);
         if (objectDebugActive) {
           objectDebugDesired = true;
@@ -611,7 +652,9 @@
         } else if (objectActive && !objectDebugActive) {
           objectDebugDesired = false;
           stopObjectLeaseTimer();
-          if (!objectControlPending) byId('objectManualStatus').textContent = `持续识别由 ${text(objectStream.session_id)} 持有，页面不会抢占`;
+          if (!objectControlPending) byId('objectManualStatus').textContent = objectHoldingActive
+            ? `检测到人物：正在以 ${fixed(objectStream.rate_hz, 1)} Hz 自动判断手持玩具/狗粮；页面可临时接管`
+            : `持续识别由 ${text(objectStream.session_id)} 持有，页面不会抢占`;
         } else if (!objectDebugDesired && objectLeaseTimer !== null) {
           stopObjectLeaseTimer();
         }
@@ -622,11 +665,15 @@
         byId('handCount').textContent = hands.length;
         byId('objectCount').textContent = objects.length;
         const active = event.active_target || {};
+        const heldObject = active.held_object || {};
         const recognized = gesture.recognized_actions || [];
         const recognizedNames = recognized.map(item => item.name).filter(Boolean);
         const topCandidate = (gesture.raw_scores || [])[0] || {};
         const temporal = gesture.temporal_features || {};
         const fall = gesture.fall_detector || {};
+        const jump = gesture.jump_detector || {};
+        const jumpComponents = jump.component_scores || {};
+        const stomp = gesture.stomp_detector || {};
         const handFeatures = gesture.hand_features || {};
         const leftHandFeatures = handFeatures.left || {};
         const rightHandFeatures = handFeatures.right || {};
@@ -640,6 +687,10 @@
           ['粗姿态 pose_state', active.pose_state], ['精确识别动作', recognizedNames.join(', ')],
           ['最高原始候选', topCandidate.name ? `${topCandidate.name} (${fixed(topCandidate.score)})` : '—'],
           ['兼容动作字段', active.pose_action_label || active.pose_action],
+          ['手持姿态状态', `${text(heldObject.state)} · ${text(heldObject.action_label || heldObject.candidate_action)}`],
+          ['手持关联证据', heldObject.object_label ? `${text(heldObject.object_label)} / ${text(heldObject.hand_source)} / 分数 ${fixed(heldObject.association_score, 3)} / ${text(heldObject.evidence_hits)}/${text(heldObject.required_hits)}` : '—'],
+          ['手持拒绝原因', heldObject.rejection_reason ? `${heldRejectionLabels[heldObject.rejection_reason] || '未分类拒绝'} (${heldObject.rejection_reason})` : '—'],
+          ['手持诊断', `seq=${text(heldObject.object_result_sequence)} / ${text(heldObject.evaluated_object_label)} conf=${optionalFixed(heldObject.evaluated_object_confidence, 3)} / wrists=${text(heldObject.valid_wrist_count)} / sync=${optionalFixed(heldObject.pose_object_sync_delta_ms, 1)}ms / wrist=${optionalFixed(heldObject.evaluated_wrist_distance_ratio, 3)}≤${optionalFixed(heldObject.wrist_distance_threshold_ratio, 3)}`],
           ['目标置信度', fixed(active.confidence)], ['最后看见', fixed(active.last_seen_age_ms, 0) + ' ms'],
         ]);
         setKv(byId('landmarker'), [
@@ -666,12 +717,34 @@
           ['躺卧判定分', fixed(fall.lying_score, 3)],
           ['跌倒转换分', fixed(fall.transition_score, 3)],
           ['跌倒报警保持', fall.alert_active === true ? '是' : '否'],
+          ['跳跃识别通道', jump.mode ? `${jumpModeLabels[jump.mode] || '未分类'} (${jump.mode})` : '—'],
+          ['跳跃阶段', jump.phase ? `${jumpPhaseLabels[jump.phase] || '未分类'} (${jump.phase})` : '—'],
+          ['跳跃原始证据', `${optionalFixed(jump.evidence_score, 3)} / 全身=${optionalFixed(jump.full_body_score, 3)} / 半身=${optionalFixed(jump.upper_body_score, 3)}`],
+          ['跳跃回落证据', optionalFixed(jump.return_score, 3)],
+          ['跳跃分项证据', `肩=${optionalFixed(jumpComponents.shoulder_upward, 3)} / 髋=${optionalFixed(jumpComponents.hip_upward, 3)} / 脚踝=${optionalFixed(jumpComponents.ankle_upward, 3)}`],
+          ['跳跃稳定性', `同步=${optionalFixed(jumpComponents.motion_coherence, 3)} / 躯干=${optionalFixed(jumpComponents.torso_stability, 3)}`],
+          ['半身基线/抬升', `${jump.baseline_ready === true ? '已就绪' : '未就绪'} / 位移=${optionalFixed(jump.upward_displacement_ratio, 3)} / 分=${optionalFixed(jumpComponents.baseline_displacement, 3)}`],
+          ['位置回落分', optionalFixed(jumpComponents.position_return, 3)],
+          ['跺脚识别通道', stomp.source === 'ankle' ? '脚踝' : stomp.source === 'knee_fallback' ? '膝部兜底' : '关键点不足'],
+          ['跺脚分数/状态', `${optionalFixed(stomp.score, 3)} / ${stomp.recognized === true ? '已识别' : '未识别'}`],
+          ['脚踝跺脚轨迹', `速度=${optionalFixed(stomp.ankle_vertical_speed, 3)} / 幅度=${optionalFixed(stomp.ankle_vertical_range_ratio, 3)} / 换向=${text(stomp.ankle_direction_changes)}`],
+          ['膝部跺脚轨迹', `速度=${optionalFixed(stomp.knee_vertical_speed, 3)} / 幅度=${optionalFixed(stomp.knee_vertical_range_ratio, 3)} / 换向=${text(stomp.knee_direction_changes)}`],
+          ['跳跃证据帧', text(jump.evidence_frames)],
+          ['跳跃确认保持', jump.active === true ? `是 · ${fixed(jump.hold_remaining_s, 2)}s` : '否'],
+          ['跳跃缺失关键点', (jump.missing_landmarks || []).join(', ') || '—'],
+          ['跳跃未成立原因', jump.rejection_reason ? `${jumpRejectionLabels[jump.rejection_reason] || '未分类'} (${jump.rejection_reason})` : '—'],
+          ['肩部垂直速度', optionalFixed(temporal.shoulder_vertical_velocity, 3)],
+          ['髋部垂直速度', optionalFixed(temporal.hip_vertical_velocity, 3)],
+          ['脚踝垂直速度', optionalFixed(temporal.ankle_vertical_velocity, 3)],
+          ['躯干尺度变化', optionalFixed(temporal.torso_scale_change_ratio, 3)],
           ['左手四指伸直', `${text(leftHandFeatures.four_fingers_extended)}/4`],
           ['左手掌朝向分', fixed(leftHandFeatures.palm_facing_score, 3)],
           ['左手运动能量', fixed(leftHandFeatures.motion_energy, 3)],
+          ['左手Stop高度', `${fixed(leftHandFeatures.stop_wrist_height_ratio, 3)} / 区域分 ${fixed(leftHandFeatures.stop_command_zone_score, 3)}`],
           ['右手四指伸直', `${text(rightHandFeatures.four_fingers_extended)}/4`],
           ['右手掌朝向分', fixed(rightHandFeatures.palm_facing_score, 3)],
           ['右手运动能量', fixed(rightHandFeatures.motion_energy, 3)],
+          ['右手Stop高度', `${fixed(rightHandFeatures.stop_wrist_height_ratio, 3)} / 区域分 ${fixed(rightHandFeatures.stop_command_zone_score, 3)}`],
           ['粗姿态', gesture.pose_state], ['兼容姿态动作', gesture.legacy_pose_action],
           ['已稳定识别', recognizedNames.join(', ') || '尚未达到稳定触发阈值'],
           ['点头垂直能量', fixed(temporal.head_vertical_motion_energy, 3)],

@@ -1,6 +1,6 @@
 # 视觉项目交接说明
 
-> 对接基线：2026-09-02 / 多项目契约 1.3.4
+> 对接基线：2026-09-03 / 多项目契约 1.3.6
 
 ## 1. 本项目负责什么
 
@@ -105,7 +105,7 @@ Service 定义见 `srv/VisionTask.srv`。当前任务：
 | `query_targets` | 返回人体/动物/物体目标；人体含原子快照 ID，查询时实时重算 age |
 | `detect_objects` | 单帧同步查询，返回 `objects[]`，不启动数据流 |
 | `set_object_detection` | 动作系统按 `session_id` 开启、续租、更新或关闭检测流 |
-| `get_object_detection_state` | 查询当前检测会话、频率、目标标签和剩余租约 |
+| `get_object_detection_state` | 查询外部 `stream` 与只读手持姿态 `automatic_stream` 的频率、目标标签和剩余租约 |
 | `recognize_face` | 对当前最大人脸识别 |
 | `start_face_enrollment` | 固定身份槽位；默认保持自然正对摄像头，自动连续采集三张注册 |
 | `cancel_face_enrollment` | 取消注册 |
@@ -157,7 +157,8 @@ ros2 launch marsdog_vision_interaction vision_debug.launch.py
 正式视觉节点，只附加页面时传入 `start_vision_node:=false`。
 
 浏览器打开 `http://127.0.0.1:8765`。绿色为人体/姿态骨架，蓝色为人脸，
-紫色为物体，橙色为手部，红色为当前目标。正式视觉节点默认不运行物体模型。
+紫色为物体，橙色为手部，红色为当前目标。正式视觉节点不运行固定物体流；人物
+处于 `tracking` 时会自动以2 Hz运行可让路的手持姿态物体流，无人2秒后停止。
 页面按钮支持单次检测以及启动/停止持续检测。持续调试固定使用
 `vision-debug-web` session 并定期续租；Action 已持有其他 session 时会拒绝启动，
 页面不会抢占。动作系统开启寻物 session 后，页面也会显示其 Topic 结果。
@@ -167,6 +168,17 @@ Topic，不会改变行为树使用的正式 `/perception/visual_event` 契约�
 普通姿态、跌倒和 Stop 手势只有在当前主目标仍为 `tracking`、属于固定人脸库且
 达到 `confirmed_known` 时才进入正式 `events[]`；陌生人、`candidate_known` 或无人脸
 状态只保留结构化姿态与 GesturePose 调试结果，不上报姿态事件。
+Stop 还要求手腕离开髋部自然下垂区并进入躯干指令区域。跳跃优先要求髋部和双脚
+共同向上且连续两帧成立；脚踝因裁切不可见时，允许使用肩髋共同上升，并要求先有
+约0.2秒稳定基线、取得一个强起跳帧或两个普通起跳帧，随后在1.1秒内观察到共同
+回落。脚踝可见但未离地时不会启用半身兜底。
+确认后保持约0.65秒；识别模式、阶段、缺失关键点和各路证据可在 GesturePose 面板查看。
+跺脚优先检查脚踝相对髋部的完整抬落周期；脚踝裁切时允许以膝部相对髋部轨迹兜底，
+但仍要求垂直幅度、速度、至少一次方向反转、稳定身体中心和直立姿态同时成立。
+手持姿态要求玩具/狗粮物体框接近当前人的有效手腕，并由1.5秒内两个阳性物体结果
+确认；允许两个阳性结果之间出现一次短暂漏检，
+分别写入 `holding_toy/holding_dog_food`。地面或桌面仅出现物体不产生TOY/FOOD事件；
+正式事件仍要求固定人脸库身份达到 `confirmed_known + tracking`。
 “Vision 已发布事件记录”在 Viewer 的 Topic 回调中记录事件开始、持续、结束，
 保留序号和目标证据，并支持复制、导出和清空。它仅验证 Vision 发布边界；测试
 行为树候选选择或 Action 执行结果时仍须分别检查对应节点日志。

@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import numpy as np
 
 from marsdog_vision_interaction.providers.base import BaseProvider
+from marsdog_vision_interaction.utils.logging_utils import vision_timing_trace
 
 logger = logging.getLogger(__name__)
 
@@ -189,33 +191,56 @@ class FaceRecognitionProvider(BaseProvider):
         if not self._enrolled:
             return {"user_id": "unknown", "confidence": 0.0, "matched": False}
 
-        embedding = self._extract_embedding(face_roi)
-        if embedding is None:
-            return {"user_id": "unknown", "confidence": 0.0, "matched": False}
-
+        started = time.perf_counter()
+        result_status = "failure"
+        reason_code = "embedding_unavailable"
         best_id = "unknown"
         best_score = 0.0
+        matched = False
+        try:
+            embedding = self._extract_embedding(face_roi)
+            if embedding is None:
+                return {
+                    "user_id": "unknown",
+                    "confidence": 0.0,
+                    "matched": False,
+                }
 
-        with self._lock:
-            for uid, templates in self._enrolled.items():
-                for stored_emb in templates:
-                    score = _cosine(embedding, stored_emb)
-                    if score > best_score:
-                        best_score = score
-                        best_id = uid
+            with self._lock:
+                for uid, templates in self._enrolled.items():
+                    for stored_emb in templates:
+                        score = _cosine(embedding, stored_emb)
+                        if score > best_score:
+                            best_score = score
+                            best_id = uid
 
-        matched = best_score >= self._match_threshold
+            matched = best_score >= self._match_threshold
+            result_status = "success"
+            reason_code = "matched" if matched else "no_match"
 
-        logger.info(
-            "FaceRecognition recognized: id=%s score=%.3f matched=%s",
-            best_id, best_score, matched,
-        )
+            logger.info(
+                "FaceRecognition recognized: id=%s score=%.3f matched=%s",
+                best_id, best_score, matched,
+            )
 
-        return {
-            "user_id": best_id if matched else "unknown",
-            "confidence": round(float(best_score), 4),
-            "matched": matched,
-        }
+            return {
+                "user_id": best_id if matched else "unknown",
+                "confidence": round(float(best_score), 4),
+                "matched": matched,
+            }
+        finally:
+            vision_timing_trace(
+                node="vision_interaction",
+                module="face_recognition",
+                stage="sface_task_recognize",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                result=result_status,
+                force=True,
+                identity=best_id if matched else "unknown",
+                confidence=round(float(best_score), 4),
+                reason_code=reason_code,
+                template_identity_count=len(self._enrolled),
+            )
 
     def clear_enrolled(self) -> None:
         """Drop the in-memory registry before rebuilding it from local storage."""

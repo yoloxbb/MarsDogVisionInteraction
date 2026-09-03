@@ -1,6 +1,10 @@
 logging:
   level: INFO
   dir: log
+  # Emit correlated single-line JSON records for automated QA evidence.
+  event_trace: true
+  # Sample continuous model/stage timings; use 0 to trace every invocation.
+  timing_trace_interval_sec: 5.0
 
 storage:
   root: ${MARSDOG_VISION_DATA_DIR}
@@ -125,6 +129,23 @@ providers:
       inference_rate_hz: 0.0
       on_demand_rate_hz: 2.0
       max_inference_rate_hz: 5.0
+      # While a human is actively tracked, a preemptible internal 2 Hz stream
+      # checks whether a toy/food box is actually near a current wrist. An
+      # explicit Action/debug session always takes scheduling priority.
+      held_pose_enabled: true
+      held_pose_rate_hz: 2.0
+      held_pose_confidence: 0.35
+      held_pose_human_absence_grace_sec: 2.0
+      held_pose_confirmation_hits: 2
+      held_pose_confirmation_window_sec: 1.5
+      held_pose_hold_sec: 1.25
+      # Pose and the independent 2 Hz RKNN stream are asynchronous; allow the
+      # normal inference skew while still rejecting unrelated old frames.
+      held_pose_max_sync_delta_sec: 0.75
+      # A held bag/frisbee can extend beyond the body box. Association remains
+      # anchored to a valid current wrist and still requires two positive hits.
+      held_pose_wrist_distance_ratio: 0.16
+      held_pose_human_bbox_expansion_ratio: 0.15
       default_lease_sec: 3.0
       max_lease_sec: 30.0
       scheduler_rate_hz: 20.0

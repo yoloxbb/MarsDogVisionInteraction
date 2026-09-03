@@ -48,6 +48,15 @@ bbox/body_center 是有限的归一化数值
 `humans[]` 每项：`track_id,x,y,w,h,confidence,pose_state,pose_action,
 pose_action_label,keypoints[]`。字段语义与 `active_target` 对应字段相同。
 
+`active_target`、匹配的 `human_candidates[]/humans[]` 还包含
+`held_object`：`state,action,action_label,candidate_action,object_label,
+object_track_id,hand_source,association_score,wrist_distance_ratio,evidence_hits,
+required_hits,last_positive_age_ms,object_result_sequence,rejection_reason,evaluated_object_label,
+evaluated_object_confidence,pose_object_sync_delta_ms,valid_wrist_count,
+evaluated_wrist_distance_ratio,wrist_distance_threshold_ratio`。它记录手腕与
+玩具/狗粮物体框的候选、确认或拒绝状态；
+`state=confirmed` 时才允许覆盖兼容 `pose_action`。
+
 `hands[]` 每项：
 
 | 字段 | 类型 / 默认值 | 含义 |
@@ -119,7 +128,7 @@ Pose 关键点对象：
 | P2 | `hunched` | posture | `pose_action=hunched_back` | `EVT_VISION_MASTER_SAD`，需确认身份 |
 | P3 | `arms_raised` | gesture | `pose_action=arm_raise_wave` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
 | P3 | `waving` | dynamic | `pose_action=arm_raise_wave` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
-| P3 | `victory` | gesture | 无；仅调试 Topic | 无 |
+| P3 | `victory` | gesture | `hand_action=victory` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
 | P3 | `jumping` | dynamic | `pose_action=jump` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
 | P3 | `arms_open` | gesture | `pose_action=lean_forward_arms_open` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
 | P3 | `fast_nod` | dynamic | `pose_action=nodding` | `EVT_VISION_MASTER_HAPPY`，需确认身份 |
@@ -133,9 +142,31 @@ Pose 关键点对象：
 一帧可以同时有一个 `pose_action` 和一个 `hand_action`。P0–P4 是规则输出优先级，
 不是 ROS QoS，也不等同于行为树候选优先级。
 
+`jumping` 优先由髋部和双脚共同上升、连续两帧确认。仅当脚踝关键点不可用且肩部、
+髋部仍可靠时，才启用半身兜底；兜底还要求约0.2秒稳定基线、肩髋同步上升、躯干
+尺度稳定，并结合相对基线的整体抬升量取得一个强起跳帧或0.35秒内两个普通起跳帧，
+最后在1.1秒内观察到同步回落或回到基线。脚踝可见但仍着地时不会走兜底路径。
+两种路径都只改变
+GesturePose 判定，不改变正式事件名称、身份门禁或发布契约。
+
+`holding_toy` 和 `holding_dog_food` 是 Pose/Hand 与物体模型联合产生的多模态特定
+姿态，不属于上述25个 GesturePose 原始标签。要求物体框接近当前人物的有效手腕、
+检测置信度至少0.35、Pose与物体源帧时间差不超过0.75秒，且1.5秒内两个不同阳性
+物体推理结果成立。两个阳性结果之间允许一次短暂漏检；物体可随伸出的手部分超出
+人物框，但远离手腕的物体仍被拒绝。它们分别显示为“手持玩具/手持狗粮”；除
+`fallen_down` 外可覆盖普通兼容
+`pose_action`，但仍受同一固定身份事件门控。
+
+`active_target.held_object.rejection_reason` 给出最近一次未成立原因，包括
+`object_not_detected`、`unsupported_label`、`low_confidence`、`no_valid_wrist`、
+`wrist_too_far`、`timestamp_mismatch`、`stale_object_sequence` 和
+`object_track_not_current` 等。配合 `evaluated_object_confidence`、
+`pose_object_sync_delta_ms`、`valid_wrist_count`、`evaluated_wrist_distance_ratio` 与
+`wrist_distance_threshold_ratio` 可直接定位拒绝条件。
+
 ### 4.8 当前会实际产生的 `events[]`
 
-事件生成顺序固定为：人脸 → 主目标姿态 → 手势 → 物体；同一事件名在一个数组
+事件生成顺序固定为：人脸 → 主目标姿态 → 手势；同一事件名在一个数组
 内去重。`events[]` 只有字符串，没有独立时间、置信度或目标 ID；相关细节必须从
 同一份消息的结构化字段读取。
 
@@ -148,11 +179,11 @@ Pose 关键点对象：
 | `EVT_VISION_MASTER_NEUTRAL` | `identity_state=confirmed_known` 的主目标出现 `neutral_stand_sit` | `pose_action`、`pose_state` |
 | `EVT_VISION_FALL` | 固定人脸库身份达到 `confirmed_known`，且 `pose_action=fallen_down`；已确认从直立快速转为持续躺卧 | `active_target.identity/identity_state`、`pose_action`；调试时看 `fall_detector` |
 | `EVT_VISION_STOP_GESTURE` | 固定人脸库身份达到 `confirmed_known`，且任一 `hands[].hand_action=stop_gesture` | `active_target.identity/identity_state`、`hands[]` |
-| `EVT_VISION_FOOD` | `tracked_objects[].label` 精确为 `dog bowl`、`dog food can` 或 `dog treat bag` | `tracked_objects[]` |
-| `EVT_VISION_TOY` | `tracked_objects[].label` 精确为 `dog toy ball`、`dog frisbee toy` 或 `dog tug ring toy` | `tracked_objects[]` |
+| `EVT_VISION_FOOD` | 固定人脸库身份达到 `confirmed_known`，且 `pose_action=holding_dog_food` | `active_target.held_object`、`tracked_objects[]` |
+| `EVT_VISION_TOY` | 固定人脸库身份达到 `confirmed_known`，且 `pose_action=holding_toy` | `active_target.held_object`、`tracked_objects[]` |
 
-FOOD/TOY 的事件映射按上述英文标签做区分大小写的精确比较；这与物体 session 的
-`target_labels` 过滤（不区分大小写）是两个不同步骤。
+手持玩具只接受 `dog toy ball/dog frisbee toy/dog tug ring toy`；手持狗粮只接受
+`dog bowl/dog food can/dog treat bag`。只检测到物体但没有手腕关联时不得产生事件。
 
 人脸事件当前以“是否存在任意 `faces[]` + 主目标身份”组合判断，并不逐张人脸绑定
 事件。多人物场景的消费者应读取 `active_target`，不要自行假定事件对应
@@ -226,8 +257,10 @@ Vision 已观察到的新事件。
 | `fall_event_triggered` | 跌倒确认帧的一次边沿 |
 | `fall_alert_active` | 跌倒确认后的短暂保持状态 |
 | `fall_detector` | `phase,armed,lying_score,transition_score,event_triggered,alert_active,cooldown_remaining_s` |
-| `hand_features.left/right` | 手是否检出、伸指状态、掌心分数、尺度和运动能量 |
-| `temporal_features` | 窗口、人体/头/手运动和双腕开合量 |
+| `jump_detector` | `mode,phase,evidence_score,full_body_score,upper_body_score,return_score,component_scores,baseline_ready,upward_displacement_ratio,evidence_frames,event_triggered,active,hold_remaining_s,cooldown_remaining_s,missing_landmarks,torso_scale_change_ratio,rejection_reason` |
+| `stomp_detector` | `source,score,recognized` 以及脚踝/膝部垂直速度、归一化幅度和换向次数 |
+| `hand_features.left/right` | 手是否检出、伸指状态、掌心分数、尺度、运动能量及 Stop 手腕高度/指令区域分 |
+| `temporal_features` | 窗口、人体/头/手运动、肩/髋/脚踝垂直速度、脚踝/膝部抬落周期、躯干尺度变化和双腕开合量 |
 | `feature_ms`、`recognition_ms` | 特征与规则耗时 |
 | `landmarker` | 模型变体、运行模式、帧计数、有效 FPS、平均/P95 耗时和检测率 |
 
@@ -239,7 +272,8 @@ Vision 已观察到的新事件。
 ### 6.1 生命周期
 
 - `schema_version`：`2`
-- 正式 `vision.yaml` 启动频率：0 Hz，即空闲时不运行物体模型
+- 正式 `vision.yaml` 固定启动频率：0 Hz；有人跟踪时内部
+  `vision-human-holding` 流自动以2 Hz运行，无人持续2秒后停止
 - 按需默认频率：2 Hz；允许范围 `(0,5]` Hz
 - 默认租约：3 秒；允许范围 `[0.5,30]` 秒
 - `vision_debug.launch.py` 是统一调试入口；页面按钮可调用 `detect_objects` 单次检测，
@@ -247,6 +281,7 @@ Vision 已观察到的新事件。
 
 动作系统用 `VisionTask.set_object_detection` 开启、续租和关闭唯一数据流。
 同一 `session_id` 才能更新或关闭现有流；不同 session 的操作会失败，不能抢占。
+显式 Action/Debug 流调度优先于内部手持姿态流；后者可让路且不阻止显式会话创建。
 
 ### 6.2 schema v2
 
@@ -377,7 +412,7 @@ float64 latency_ms
 | `query_targets` | 可选 `target_types,min_confidence,max_age_ms` | `ok,header,vision_epoch,sequence,snapshot_id,snapshot_age_ms,targets[],human_candidates[],animal_candidates[],object_candidates[],active_target` | 只读目标事实；查询时实时重算年龄，不启动物体流 |
 | `detect_objects` | 可选 `confidence,target_labels[]` | `ok,objects[]` | 同步单帧推理，并发布 `source=service`；不启动持续流 |
 | `set_object_detection` | `enabled,session_id`；开启时可选 `rate_hz,confidence,target_labels[],lease_sec` | `ok,stream`；关闭时还含 `stopped_session_id` | 开启、续租、更新或关闭唯一物体流 |
-| `get_object_detection_state` | `{}` | `ok,stream` | 只读当前 session 状态 |
+| `get_object_detection_state` | `{}` | `ok,stream,automatic_stream` | `stream` 只表示 Action/调试页持有的外部 session；`automatic_stream` 只读人出现后用于手持姿态的自动 2 Hz session，不能据此判定外部 session 被占用 |
 | `recognize_face` | `{}` | `ok,user_id,confidence,matched` | 对当前最大人脸同步识别 |
 | `start_face_enrollment` | 固定 `name`，可选 `required_shots`（默认 3，范围1～5） | `ok,name,step,total_steps,pose,prompt` | 在该身份剩余槽位中新建注册会话；自然面对摄像头，无动作要求 |
 | `cancel_face_enrollment` | `{}` | `ok,name,cancelled` | 无会话时失败 |
@@ -433,8 +468,10 @@ POST/PUT 先完成图片解码、人脸检测、质量门控和裁剪，成功�
 
 ### 8.4 人体目标快照查询
 xi | `phase,armed,lying_score,transition_score,event_triggered,alert_active,cooldown_remaining_s` |
-| `hand_features.left/right` | 手是否检出、伸指状态、掌心分数、尺度和运动能量 |
-| `temporal_features` | 窗口、人体/头/手运动和双腕开合量 |
+| `jump_detector` | 全身/半身识别模式、起跳/回落阶段、缺失关键点、各路证据、确认边沿、保持、冷却和拒绝原因 |
+| `stomp_detector` | 脚踝/膝部识别通道、跺脚分数、识别状态以及速度、幅度和换向次数 |
+| `hand_features.left/right` | 手是否检出、伸指状态、掌心分数、尺度、运动能量及 Stop 手腕高度/指令区域分 |
+| `temporal_features` | 窗口、人体/头/手运动、肩/髋/脚踝垂直速度、脚踝/膝部抬落周期、躯干尺度变化和双腕开合量 |
 | `feature_ms`、`recognition_ms` | 特征与规则耗时 |
 | `landmarker` | 模型变体、运行模式、帧计数、有效 FPS、平均/P95 耗时和检测率 |
 
@@ -446,7 +483,8 @@ xi | `phase,armed,lying_score,transition_score,event_triggered,alert_active,cool
 ### 6.1 生命周期
 
 - `schema_version`：`2`
-- 正式 `vision.yaml` 启动频率：0 Hz，即空闲时不运行物体模型
+- 正式 `vision.yaml` 固定启动频率：0 Hz；有人跟踪时内部
+  `vision-human-holding` 流自动以2 Hz运行，无人持续2秒后停止
 - 按需默认频率：2 Hz；允许范围 `(0,5]` Hz
 - 默认租约：3 秒；允许范围 `[0.5,30]` 秒
 - `vision_debug.launch.py` 是统一调试入口；页面按钮可调用 `detect_objects` 单次检测，
@@ -454,6 +492,7 @@ xi | `phase,armed,lying_score,transition_score,event_triggered,alert_active,cool
 
 动作系统用 `VisionTask.set_object_detection` 开启、续租和关闭唯一数据流。
 同一 `session_id` 才能更新或关闭现有流；不同 session 的操作会失败，不能抢占。
+显式 Action/Debug 流调度优先于内部手持姿态流；后者可让路且不阻止显式会话创建。
 
 ### 6.2 schema v2
 
@@ -584,7 +623,7 @@ float64 latency_ms
 | `query_targets` | 可选 `target_types,min_confidence,max_age_ms` | `ok,header,vision_epoch,sequence,snapshot_id,snapshot_age_ms,targets[],human_candidates[],animal_candidates[],object_candidates[],active_target` | 只读目标事实；查询时实时重算年龄，不启动物体流 |
 | `detect_objects` | 可选 `confidence,target_labels[]` | `ok,objects[]` | 同步单帧推理，并发布 `source=service`；不启动持续流 |
 | `set_object_detection` | `enabled,session_id`；开启时可选 `rate_hz,confidence,target_labels[],lease_sec` | `ok,stream`；关闭时还含 `stopped_session_id` | 开启、续租、更新或关闭唯一物体流 |
-| `get_object_detection_state` | `{}` | `ok,stream` | 只读当前 session 状态 |
+| `get_object_detection_state` | `{}` | `ok,stream,automatic_stream` | `stream` 只表示 Action/调试页持有的外部 session；`automatic_stream` 只读人出现后用于手持姿态的自动 2 Hz session，不能据此判定外部 session 被占用 |
 | `recognize_face` | `{}` | `ok,user_id,confidence,matched` | 对当前最大人脸同步识别 |
 | `start_face_enrollment` | 固定 `name`，可选 `required_shots`（默认 3，范围1～5） | `ok,name,step,total_steps,pose,prompt` | 在该身份剩余槽位中新建注册会话；自然面对摄像头，无动作要求 |
 | `cancel_face_enrollment` | `{}` | `ok,name,cancelled` | 无会话时失败 |
@@ -718,7 +757,8 @@ IoU 关联，ID 为 `<vision_epoch>:object:<track_id>`，绝不使用 label 充�
 | 人体候选 | 最多 5 人 | `max_num_poses=5`；每人独立 `target_id`，业务选择在行为树 |
 | 相机过期 | 0.5 秒 | 清空当前场景事实，不刷新旧目标年龄 |
 | 对齐深度过期 | 0.5 秒 | 立即回退 `range_valid=false`，不允许框大小估距 |
-| 正式物体流 | 0 Hz | 由 Action session 按需开启，默认 2 Hz、最大 5 Hz |
+| 固定物体流 | 0 Hz | 不再全天候推理；Action session 按需开启 |
+| 手持姿态物体流 | 人物可见时 2 Hz | session=`vision-human-holding`；显式流优先；无人2秒后停止 |
 | 物体镜像缓存 | 2 秒 | 只影响 `visual_event.tracked_objects[]`，不替代物体 v2 Topic |
 
 Pose、Hand、YuNet 或 SFace 加载失败时节点可能继续运行，但对应数组/字段会为空或

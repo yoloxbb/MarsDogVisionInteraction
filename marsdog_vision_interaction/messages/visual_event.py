@@ -10,6 +10,29 @@ from marsdog_vision_interaction.utils.time_utils import now_stamp
 
 SCHEMA_VERSION = 1
 
+_HELD_OBJECT = {
+    "state": "inactive",
+    "action": "",
+    "action_label": "",
+    "candidate_action": "",
+    "object_label": "",
+    "object_track_id": -1,
+    "hand_source": "",
+    "association_score": 0.0,
+    "wrist_distance_ratio": None,
+    "evidence_hits": 0,
+    "required_hits": 2,
+    "last_positive_age_ms": None,
+    "object_result_sequence": 0,
+    "rejection_reason": "",
+    "evaluated_object_label": "",
+    "evaluated_object_confidence": 0.0,
+    "pose_object_sync_delta_ms": None,
+    "valid_wrist_count": 0,
+    "evaluated_wrist_distance_ratio": None,
+    "wrist_distance_threshold_ratio": 0.0,
+}
+
 _ACTIVE_TARGET = {
     "vision_epoch": "",
     "target_id": "",
@@ -32,6 +55,7 @@ _ACTIVE_TARGET = {
     "pose_state": "unknown",
     "pose_action": "",
     "pose_action_label": "",
+    "held_object": copy.deepcopy(_HELD_OBJECT),
     "keypoints": [],
     "confidence": 0.0,
     "detection_confidence": 0.0,
@@ -79,6 +103,7 @@ _HUMAN = {
     "pose_state": "",
     "pose_action": "",
     "pose_action_label": "",
+    "held_object": copy.deepcopy(_HELD_OBJECT),
     "keypoints": [],
 }
 
@@ -100,6 +125,7 @@ _HUMAN_CANDIDATE = {
     "pose_state": "unknown",
     "pose_action": "",
     "pose_action_label": "",
+    "held_object": copy.deepcopy(_HELD_OBJECT),
     "keypoints": [],
     "confidence": 0.0,
     "detection_confidence": 0.0,
@@ -130,6 +156,15 @@ _HAND = {
 }
 
 _OBJECT = {
+    # Preserve the exact detector-result provenance.  Held-object association
+    # counts distinct detector results and must not confuse a persisted track
+    # from an older result with evidence from the current inference cycle.
+    "header": {
+        "stamp": 0.0,
+        "frame_id": "",
+    },
+    "source_sequence": 0,
+    "source_snapshot_id": "",
     "vision_epoch": "",
     "target_id": "",
     "target_type": "object",

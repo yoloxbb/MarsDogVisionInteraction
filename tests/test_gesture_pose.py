@@ -114,6 +114,78 @@ def _hand_at(
     )
 
 
+def _forward_palm_at_wrist(
+    wrist_x: float,
+    wrist_y: float,
+) -> tuple[HandLandmark, ...]:
+    hand = _forward_palm()
+    return tuple(
+        HandLandmark(
+            point.x + wrist_x - hand[0].x,
+            point.y + wrist_y - hand[0].y,
+            point.z,
+        )
+        for point in hand
+    )
+
+
+def _shift_pose(
+    pose: tuple[PoseLandmark, ...],
+    *,
+    dy: float,
+    keep_ankles_planted: bool = False,
+) -> tuple[PoseLandmark, ...]:
+    shifted: list[PoseLandmark] = []
+    for index, point in enumerate(pose):
+        point_dy = 0.0 if keep_ankles_planted and index in (27, 28) else dy
+        shifted.append(
+            PoseLandmark(
+                point.x,
+                point.y + point_dy,
+                point.z,
+                point.visibility,
+                point.presence,
+            )
+        )
+    return tuple(shifted)
+
+
+def _hide_pose_landmarks(
+    pose: tuple[PoseLandmark, ...],
+    *indices: int,
+) -> tuple[PoseLandmark, ...]:
+    hidden = set(indices)
+    return tuple(
+        PoseLandmark(
+            point.x,
+            point.y,
+            point.z,
+            0.0 if index in hidden else point.visibility,
+            0.0 if index in hidden else point.presence,
+        )
+        for index, point in enumerate(pose)
+    )
+
+
+def _shift_selected_pose_landmarks(
+    pose: tuple[PoseLandmark, ...],
+    indices: tuple[int, ...],
+    *,
+    dy: float,
+) -> tuple[PoseLandmark, ...]:
+    selected = set(indices)
+    return tuple(
+        PoseLandmark(
+            point.x,
+            point.y + (dy if index in selected else 0.0),
+            point.z,
+            point.visibility,
+            point.presence,
+        )
+        for index, point in enumerate(pose)
+    )
+
+
 def _face_covering_pose() -> tuple[PoseLandmark, ...]:
     return _pose_with_arms(
         left_elbow=(0.42, 0.31),
@@ -141,9 +213,31 @@ def test_standing_action_is_deterministic_and_keeps_public_key() -> None:
     assert snapshots[-1]["recognized_actions"][0]["priority"] == "P4"
     assert snapshots[-1]["recognized_actions"][0]["group"] == "posture"
     assert "head_vertical_range_ratio" in snapshots[-1]["temporal_features"]
+    assert "ankle_vertical_velocity" in snapshots[-1]["temporal_features"]
+    assert "shoulder_vertical_velocity" in snapshots[-1]["temporal_features"]
+    assert "torso_scale_change_ratio" in snapshots[-1]["temporal_features"]
     assert snapshots[-1]["fall_detector"]["armed"] is False
     assert snapshots[-1]["fall_detector"]["lying_score"] == 0.0
+    assert snapshots[-1]["jump_detector"]["active"] is False
+    assert snapshots[-1]["jump_detector"]["mode"] == "full_body"
+    assert snapshots[-1]["jump_detector"]["phase"] == "monitoring"
+    assert snapshots[-1]["jump_detector"]["missing_landmarks"] == []
+    assert set(snapshots[-1]["jump_detector"]["component_scores"]) == {
+        "hip_upward",
+        "shoulder_upward",
+        "ankle_upward",
+        "motion_coherence",
+        "torso_stability",
+        "baseline_displacement",
+        "position_return",
+    }
     assert snapshots[-1]["hand_features"]["left"]["detected"] is False
+    assert (
+        snapshots[-1]["hand_features"]["left"][
+            "stop_command_zone_score"
+        ]
+        == 0.0
+    )
 
 
 def test_entering_frame_while_lying_never_fabricates_fall_event() -> None:
@@ -370,6 +464,359 @@ def test_camera_facing_open_palm_still_triggers_stop() -> None:
 
     assert any(
         ActionName.STOP_GESTURE in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_naturally_lowered_open_hand_does_not_trigger_stop() -> None:
+    """A straight resting arm must not count as an intentional command."""
+
+    lowered_wrist = (0.38, 0.67)
+    pose = _pose_with_arms(
+        left_elbow=(0.38, 0.49),
+        right_elbow=(0.62, 0.48),
+        left_wrist=lowered_wrist,
+        right_wrist=(0.62, 0.65),
+    )
+    engine = BehaviorEngine()
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=1.0 + index * 0.1,
+                pose_landmarks=pose,
+                left_hand=_forward_palm_at_wrist(*lowered_wrist),
+            )
+        )
+        for index in range(8)
+    ]
+
+    assert max(
+        result.raw_score_map[ActionName.STOP_GESTURE]
+        for result in results
+    ) == 0.0
+    assert all(
+        ActionName.STOP_GESTURE not in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_short_takeoff_is_confirmed_and_held_as_jumping() -> None:
+    """Two take-off frames must survive long enough for stable publication."""
+
+    standing = _pose("standing")
+    engine = BehaviorEngine()
+    for index in range(8):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=standing,
+            )
+        )
+
+    observations = (
+        _shift_pose(standing, dy=-0.05),
+        _shift_pose(standing, dy=-0.10),
+        _shift_pose(standing, dy=-0.10),
+        _shift_pose(standing, dy=-0.08),
+        _shift_pose(standing, dy=-0.04),
+    )
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.9 + index * 0.1,
+                pose_landmarks=pose,
+            )
+        )
+        for index, pose in enumerate(observations)
+    ]
+
+    assert sum(result.jump_status.event_triggered for result in results) == 1
+    assert any(result.jump_status.active for result in results)
+    assert any(
+        ActionName.JUMPING in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_standing_up_with_planted_feet_is_not_jumping() -> None:
+    """Hip-only upward motion is a stand-up, not an airborne take-off."""
+
+    standing = _pose("standing")
+    engine = BehaviorEngine()
+    for index in range(8):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=standing,
+            )
+        )
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.9 + index * 0.1,
+                pose_landmarks=_shift_pose(
+                    standing,
+                    dy=-0.05 * (index + 1),
+                    keep_ankles_planted=True,
+                ),
+            )
+        )
+        for index in range(3)
+    ]
+
+    assert not any(result.jump_status.event_triggered for result in results)
+    assert all(
+        ActionName.JUMPING not in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_cropped_upper_body_jump_confirms_after_downward_return() -> None:
+    """Missing ankles use coherent shoulder/hip lift plus return evidence."""
+
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    engine = BehaviorEngine()
+    for index in range(8):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=cropped,
+            )
+        )
+
+    offsets = (-0.05, -0.10, -0.10, -0.05, -0.02, 0.0, 0.0)
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.9 + index * 0.1,
+                pose_landmarks=_shift_pose(cropped, dy=offset),
+            )
+        )
+        for index, offset in enumerate(offsets)
+    ]
+
+    triggered = [result for result in results if result.jump_status.event_triggered]
+    assert len(triggered) == 1
+    assert triggered[0].jump_status.mode == "upper_body_fallback"
+    assert triggered[0].jump_status.missing_landmarks == (
+        "left_ankle",
+        "right_ankle",
+    )
+    assert any(result.jump_status.phase == "awaiting_return" for result in results)
+    assert any(
+        ActionName.JUMPING in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_low_fps_cropped_jump_accepts_one_strong_takeoff_sample() -> None:
+    """A short jump must remain observable near the runtime's 5 FPS cadence."""
+
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    engine = BehaviorEngine()
+    for index in range(4):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.2 + index * 0.2,
+                pose_landmarks=cropped,
+            )
+        )
+
+    observations = (
+        (1.0, -0.015),
+        (1.2, -0.015),
+        (1.4, 0.0),
+        (1.6, 0.0),
+        (1.8, 0.0),
+    )
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=timestamp,
+                pose_landmarks=_shift_pose(cropped, dy=offset),
+            )
+        )
+        for timestamp, offset in observations
+    ]
+
+    triggered = [result for result in results if result.jump_status.event_triggered]
+    assert len(triggered) == 1
+    assert triggered[0].jump_status.mode == "upper_body_fallback"
+    assert any(
+        ActionName.JUMPING in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_cropped_standing_up_without_return_is_not_jumping() -> None:
+    """A persistent height change must not pass the cropped-body fallback."""
+
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    engine = BehaviorEngine()
+    for index in range(8):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=cropped,
+            )
+        )
+    offsets = (-0.05, -0.10) + (-0.10,) * 12
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.9 + index * 0.1,
+                pose_landmarks=_shift_pose(cropped, dy=offset),
+            )
+        )
+        for index, offset in enumerate(offsets)
+    ]
+
+    assert not any(result.jump_status.event_triggered for result in results)
+    assert any(
+        result.jump_status.rejection_reason == "return_not_observed"
+        for result in results
+    )
+    assert all(
+        ActionName.JUMPING not in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_missing_hips_cannot_use_upper_body_jump_fallback() -> None:
+    cropped = _hide_pose_landmarks(_pose("standing"), 23, 24, 27, 28)
+    engine = BehaviorEngine()
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=_shift_pose(cropped, dy=-0.04 * index),
+            )
+        )
+        for index in range(8)
+    ]
+
+    assert results[-1].jump_status.mode == "unavailable"
+    assert all(not result.jump_status.event_triggered for result in results)
+    assert results[-1].jump_status.rejection_reason == "insufficient_upper_body"
+
+
+def test_cropped_knee_lift_and_return_triggers_stomping_at_low_fps() -> None:
+    """Knee motion is the fallback when a close crop removes both ankles."""
+
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    engine = BehaviorEngine()
+    for index in range(5):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.2 + index * 0.2,
+                pose_landmarks=cropped,
+            )
+        )
+
+    offsets = (-0.03, -0.06, -0.02, 0.0, 0.0, 0.0, 0.0)
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=1.2 + index * 0.2,
+                pose_landmarks=_shift_selected_pose_landmarks(
+                    cropped,
+                    (25,),
+                    dy=offset,
+                ),
+            )
+        )
+        for index, offset in enumerate(offsets)
+    ]
+
+    assert max(
+        result.raw_score_map[ActionName.STOMPING] for result in results
+    ) >= 0.55
+    assert any(
+        ActionName.STOMPING in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_cropped_knee_raise_without_return_is_not_stomping() -> None:
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    engine = BehaviorEngine()
+    offsets = (0.0, 0.0, 0.0, -0.05, -0.05, -0.05, -0.05, -0.05)
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.2 + index * 0.2,
+                pose_landmarks=_shift_selected_pose_landmarks(
+                    cropped,
+                    (25,),
+                    dy=offset,
+                ),
+            )
+        )
+        for index, offset in enumerate(offsets)
+    ]
+
+    assert max(
+        result.raw_score_map[ActionName.STOMPING] for result in results
+    ) == 0.0
+    assert all(
+        ActionName.STOMPING not in {action.name for action in result.actions}
+        for result in results
+    )
+
+
+def test_cropped_stomp_diagnostics_report_knee_fallback() -> None:
+    cropped = _hide_pose_landmarks(_pose("standing"), 27, 28)
+    classifier = PoseActionClassifier()
+    snapshots = []
+    offsets = (0.0, 0.0, 0.0, -0.03, -0.06, -0.02, 0.0, 0.0, 0.0)
+    for index, offset in enumerate(offsets):
+        snapshots.append(
+            classifier.update(
+                track_id=7,
+                pose_landmarks=_shift_selected_pose_landmarks(
+                    cropped,
+                    (25,),
+                    dy=offset,
+                ),
+                now=0.2 + index * 0.2,
+            )
+        )
+
+    assert snapshots[-1]["stomp_detector"]["source"] == "knee_fallback"
+    assert snapshots[-1]["stomp_detector"]["knee_direction_changes"] >= 1
+    assert any(snapshot["stomp_detector"]["recognized"] for snapshot in snapshots)
+
+
+def test_single_frame_full_body_shift_does_not_trigger_jump() -> None:
+    """One camera/body-position discontinuity is not a confirmed take-off."""
+
+    standing = _pose("standing")
+    engine = BehaviorEngine()
+    for index in range(8):
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.1 + index * 0.1,
+                pose_landmarks=standing,
+            )
+        )
+    results = [
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=0.9,
+                pose_landmarks=_shift_pose(standing, dy=-0.08),
+            )
+        ),
+        engine.update(
+            LandmarkFrame(
+                monotonic_s=1.0,
+                pose_landmarks=standing,
+            )
+        ),
+    ]
+
+    assert not any(result.jump_status.event_triggered for result in results)
+    assert all(
+        ActionName.JUMPING not in {action.name for action in result.actions}
         for result in results
     )
 

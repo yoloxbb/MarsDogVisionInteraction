@@ -3,6 +3,10 @@ import time
 
 import pytest
 
+from marsdog_vision_interaction.core.held_object_pose import (
+    HOLDING_DOG_FOOD,
+    HeldObjectPoseManager,
+)
 from marsdog_vision_interaction.core.visual_target_manager import (
     VisualTargetManager,
 )
@@ -11,6 +15,29 @@ from marsdog_vision_interaction.messages.visual_event import (
 )
 from marsdog_vision_interaction.messages import visual_event_types
 from marsdog_vision_interaction.providers.gesture_pose_engine import ActionName
+from marsdog_vision_interaction.providers.pose_action import (
+    _HAND_ACTIONS,
+    get_action_category,
+    get_action_label,
+)
+
+
+def test_victory_is_a_public_happy_hand_action() -> None:
+    assert _HAND_ACTIONS[ActionName.VICTORY] == "victory"
+    assert get_action_category("victory") == "hand"
+    assert get_action_label("victory") == "胜利/V字手势"
+    assert (
+        visual_event_types.pose_action_to_vision_event(
+            "victory", identity_confirmed=True
+        )
+        == visual_event_types.EVT_VISION_MASTER_HAPPY
+    )
+    assert (
+        visual_event_types.pose_action_to_vision_event(
+            "victory", identity_confirmed=False
+        )
+        == ""
+    )
 
 
 def test_visual_contract_preserves_identity_and_pose() -> None:
@@ -19,6 +46,12 @@ def test_visual_contract_preserves_identity_and_pose() -> None:
             "track_id": 7,
             "identity": "alice",
             "pose_action": "arm_raise_wave",
+            "held_object": {
+                "state": "confirmed",
+                "action": "holding_toy",
+                "object_label": "dog toy ball",
+                "evidence_hits": 2,
+            },
         },
         "faces": [{
             "track_id": 17,
@@ -29,10 +62,97 @@ def test_visual_contract_preserves_identity_and_pose() -> None:
     assert value["schema_version"] == 1
     assert value["active_target"]["identity"] == "alice"
     assert value["active_target"]["pose_action"] == "arm_raise_wave"
+    assert value["active_target"]["held_object"]["state"] == "confirmed"
+    assert value["active_target"]["held_object"]["action"] == "holding_toy"
+    assert value["active_target"]["held_object"]["required_hits"] == 2
+    assert value["active_target"]["held_object"]["object_result_sequence"] == 0
+    assert value["active_target"]["held_object"]["rejection_reason"] == ""
+    assert value["active_target"]["held_object"][
+        "evaluated_wrist_distance_ratio"
+    ] is None
     assert value["active_target"]["range_source"] == "none"
     assert value["active_target"]["depth_sync_delta_ms"] is None
     assert value["faces"][0]["track_id"] == 17
+
+
+def test_visual_contract_preserves_object_result_provenance() -> None:
+    value = normalize_visual_event({
+        "tracked_objects": [{
+            "label": "dog treat bag",
+            "confidence": 0.5621,
+            "bbox": [0.72, 0.44, 0.20, 0.42],
+            "tracking_state": "tracking",
+            "source_sequence": 314,
+            "source_snapshot_id": "epoch-1:object-result:314",
+            "header": {
+                "stamp": 1788424354.5,
+                "frame_id": "camera_color_optical_frame",
+            },
+        }],
+    })
+
+    detected = value["tracked_objects"][0]
+    assert detected["source_sequence"] == 314
+    assert detected["source_snapshot_id"] == "epoch-1:object-result:314"
+    assert detected["header"] == {
+        "stamp": 1788424354.5,
+        "frame_id": "camera_color_optical_frame",
+    }
     assert "_gesture_diagnostics" not in value
+
+
+def test_normalized_object_results_can_confirm_held_food() -> None:
+    manager = HeldObjectPoseManager()
+    target = {
+        "target_id": "epoch-1:human:1",
+        "track_id": 1,
+        "tracking_state": "tracking",
+        "confidence": 0.9,
+        "bbox": [0.40, 0.10, 0.48, 0.84],
+        "keypoints": [{
+            "id": 16,
+            "x": 0.82,
+            "y": 0.54,
+            "confidence": 0.9,
+            "presence": 0.9,
+        }],
+    }
+
+    def normalized_object(sequence: int, stamp: float) -> dict:
+        event = normalize_visual_event({
+            "tracked_objects": [{
+                "label": "dog treat bag",
+                "confidence": 0.56,
+                "bbox": [0.78, 0.48, 0.18, 0.40],
+                "tracking_state": "tracking",
+                "source_sequence": sequence,
+                "source_snapshot_id": f"epoch-1:object-result:{sequence}",
+                "header": {"stamp": stamp, "frame_id": "camera_link"},
+            }],
+        })
+        return event["tracked_objects"][0]
+
+    first = manager.update(
+        now=10.0,
+        active_target=target,
+        hands=[],
+        objects=[normalized_object(314, 100.0)],
+        object_result_sequence=314,
+        pose_observation_stamp=100.1,
+    )
+    confirmed = manager.update(
+        now=10.5,
+        active_target=target,
+        hands=[],
+        objects=[normalized_object(315, 100.5)],
+        object_result_sequence=315,
+        pose_observation_stamp=100.6,
+    )
+
+    assert first.state == "candidate"
+    assert first.rejection_reason == ""
+    assert confirmed.state == "confirmed"
+    assert confirmed.action == HOLDING_DOG_FOOD
 
 
 def test_visual_target_manager_has_no_audio_update_api() -> None:

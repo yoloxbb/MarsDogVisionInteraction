@@ -208,6 +208,12 @@ class TemporalFeatures:
     head_vertical_direction_changes: int
     head_vertical_range_ratio: float | None
     max_ankle_speed: float | None
+    max_ankle_vertical_speed: float | None
+    ankle_vertical_range_ratio: float | None
+    ankle_vertical_direction_changes: int
+    max_knee_vertical_speed: float | None
+    knee_vertical_range_ratio: float | None
+    knee_vertical_direction_changes: int
     wrist_distance_ratio: float | None
     wrist_distance_min_ratio: float | None
     wrist_distance_max_ratio: float | None
@@ -216,7 +222,10 @@ class TemporalFeatures:
     wrist_distance_closing_speed: float | None
     wrist_distance_opening_speed: float | None
     wrist_distance_direction_changes: int
+    shoulder_vertical_velocity: float | None
     hip_vertical_velocity: float | None
+    ankle_vertical_velocity: float | None
+    torso_scale_change_ratio: float | None
     stillness_duration_s: float
 
 
@@ -894,8 +903,9 @@ def _temporal_pose_change(samples: Sequence[TemporalLandmarkSample]) -> float | 
     return _temporal_average(distances)
 
 
-def _temporal_latest_hip_vertical_velocity(
+def _temporal_latest_group_vertical_velocity(
     samples: Sequence[TemporalLandmarkSample],
+    indices: tuple[int, ...],
 ) -> float | None:
     if len(samples) < 2:
         return None
@@ -903,16 +913,118 @@ def _temporal_latest_hip_vertical_velocity(
     previous = previous_sample.data.pose_landmarks
     current = current_sample.data.pose_landmarks
     delta_s = current_sample.monotonic_s - previous_sample.monotonic_s
-    if previous is None or current is None or len(previous) < 25 or len(current) < 25:
+    if (
+        previous is None
+        or current is None
+        or len(previous) <= max(indices)
+        or len(current) <= max(indices)
+    ):
+        return None
+    if any(
+        min(
+            previous[index].visibility,
+            previous[index].presence,
+            current[index].visibility,
+            current[index].presence,
+        ) < 0.5
+        for index in indices
+    ):
         return None
     scale_values = [
         value for value in (_temporal_pose_scale(previous), _temporal_pose_scale(current)) if value
     ]
     if not scale_values or delta_s <= _EPSILON:
         return None
-    previous_y = (previous[23].y + previous[24].y) / 2.0
-    current_y = (current[23].y + current[24].y) / 2.0
+    previous_y = sum(previous[index].y for index in indices) / len(indices)
+    current_y = sum(current[index].y for index in indices) / len(indices)
     return (current_y - previous_y) / (sum(scale_values) / len(scale_values)) / delta_s
+
+
+def _temporal_latest_hip_vertical_velocity(
+    samples: Sequence[TemporalLandmarkSample],
+) -> float | None:
+    return _temporal_latest_group_vertical_velocity(samples, (23, 24))
+
+
+def _temporal_latest_torso_scale_change_ratio(
+    samples: Sequence[TemporalLandmarkSample],
+) -> float | None:
+    """Return adjacent-frame torso-scale change for rigid-lift checks."""
+    if len(samples) < 2:
+        return None
+    previous = samples[-2].data.pose_landmarks
+    current = samples[-1].data.pose_landmarks
+    if previous is None or current is None:
+        return None
+    required = (11, 12, 23, 24)
+    if any(
+        min(
+            previous[index].visibility,
+            previous[index].presence,
+            current[index].visibility,
+            current[index].presence,
+        ) < 0.5
+        for index in required
+    ):
+        return None
+    previous_scale = _temporal_pose_scale(previous)
+    current_scale = _temporal_pose_scale(current)
+    if previous_scale is None or current_scale is None:
+        return None
+    return (current_scale - previous_scale) / max(previous_scale, _EPSILON)
+
+
+def _temporal_relative_vertical_series(
+    samples: Sequence[TemporalLandmarkSample],
+    point_index: int,
+    anchor_index: int,
+    *,
+    max_samples: int = 10,
+) -> list[tuple[float, float]]:
+    """Return recent point-to-joint vertical positions normalized by torso."""
+
+    values: list[tuple[float, float]] = []
+    for sample in samples[-max_samples:]:
+        landmarks = sample.data.pose_landmarks
+        scale = _temporal_pose_scale(landmarks)
+        if (
+            landmarks is None
+            or scale is None
+            or max(point_index, anchor_index) >= len(landmarks)
+            or min(
+                landmarks[point_index].visibility,
+                landmarks[point_index].presence,
+                landmarks[anchor_index].visibility,
+                landmarks[anchor_index].presence,
+            ) < 0.5
+        ):
+            continue
+        values.append(
+            (
+                sample.monotonic_s,
+                (landmarks[point_index].y - landmarks[anchor_index].y)
+                / scale,
+            )
+        )
+    return values
+
+
+def _temporal_vertical_cycle_metrics(
+    values: Sequence[tuple[float, float]],
+) -> tuple[float | None, float | None, int]:
+    if len(values) < 2:
+        return None, None, 0
+    velocities = [
+        (current[1] - previous[1]) / (current[0] - previous[0])
+        for previous, current in zip(values, values[1:], strict=False)
+        if current[0] - previous[0] > _EPSILON
+    ]
+    position_values = [value for _, value in values]
+    return (
+        max((abs(value) for value in velocities), default=None),
+        max(position_values) - min(position_values),
+        _temporal_direction_changes(velocities, minimum_magnitude=0.10),
+    )
 
 
 def extract_temporal_features(
@@ -939,6 +1051,12 @@ def extract_temporal_features(
             head_vertical_direction_changes=0,
             head_vertical_range_ratio=None,
             max_ankle_speed=None,
+            max_ankle_vertical_speed=None,
+            ankle_vertical_range_ratio=None,
+            ankle_vertical_direction_changes=0,
+            max_knee_vertical_speed=None,
+            knee_vertical_range_ratio=None,
+            knee_vertical_direction_changes=0,
             wrist_distance_ratio=None,
             wrist_distance_min_ratio=None,
             wrist_distance_max_ratio=None,
@@ -947,7 +1065,10 @@ def extract_temporal_features(
             wrist_distance_closing_speed=None,
             wrist_distance_opening_speed=None,
             wrist_distance_direction_changes=0,
+            shoulder_vertical_velocity=None,
             hip_vertical_velocity=None,
+            ankle_vertical_velocity=None,
+            torso_scale_change_ratio=None,
             stillness_duration_s=0.0,
         )
 
@@ -1111,6 +1232,30 @@ def extract_temporal_features(
     wrist_distance_min = min(recent_distance_values) if recent_distance_values else None
     wrist_distance_max = max(recent_distance_values) if recent_distance_values else None
 
+    ankle_cycle_metrics = [
+        _temporal_vertical_cycle_metrics(
+            _temporal_relative_vertical_series(samples, point, hip)
+        )
+        for point, hip in ((27, 23), (28, 24))
+    ]
+    knee_cycle_metrics = [
+        _temporal_vertical_cycle_metrics(
+            _temporal_relative_vertical_series(samples, point, hip)
+        )
+        for point, hip in ((25, 23), (26, 24))
+    ]
+
+    def maximum_metric(
+        metrics: Sequence[tuple[float | None, float | None, int]],
+        index: int,
+    ) -> float | None:
+        present = [
+            value
+            for metric in metrics
+            if (value := metric[index]) is not None
+        ]
+        return max(present) if present else None
+
     return TemporalFeatures(
         window_frames=len(samples),
         window_duration_s=max(0.0, samples[-1].monotonic_s - samples[0].monotonic_s),
@@ -1146,6 +1291,18 @@ def extract_temporal_features(
             else None
         ),
         max_ankle_speed=max(ankle_speeds) if ankle_speeds else None,
+        max_ankle_vertical_speed=maximum_metric(ankle_cycle_metrics, 0),
+        ankle_vertical_range_ratio=maximum_metric(ankle_cycle_metrics, 1),
+        ankle_vertical_direction_changes=max(
+            (metric[2] for metric in ankle_cycle_metrics),
+            default=0,
+        ),
+        max_knee_vertical_speed=maximum_metric(knee_cycle_metrics, 0),
+        knee_vertical_range_ratio=maximum_metric(knee_cycle_metrics, 1),
+        knee_vertical_direction_changes=max(
+            (metric[2] for metric in knee_cycle_metrics),
+            default=0,
+        ),
         wrist_distance_ratio=(recent_wrist_distances[-1][1] if recent_wrist_distances else None),
         wrist_distance_min_ratio=wrist_distance_min,
         wrist_distance_max_ratio=wrist_distance_max,
@@ -1169,7 +1326,16 @@ def extract_temporal_features(
         wrist_distance_direction_changes=_temporal_direction_changes(
             wrist_distance_velocities, minimum_magnitude=0.12
         ),
+        shoulder_vertical_velocity=_temporal_latest_group_vertical_velocity(
+            samples, (11, 12)
+        ),
         hip_vertical_velocity=_temporal_latest_hip_vertical_velocity(samples),
+        ankle_vertical_velocity=_temporal_latest_group_vertical_velocity(
+            samples, (27, 28)
+        ),
+        torso_scale_change_ratio=_temporal_latest_torso_scale_change_ratio(
+            samples
+        ),
         stillness_duration_s=stillness_duration_s,
     )
 
@@ -1700,11 +1866,414 @@ class ActionScore:
 
 
 @dataclass(frozen=True, slots=True)
+class JumpMotionEvidence:
+    """Full-body and cropped upper-body evidence for one inference frame."""
+
+    full_body_score: float
+    upper_body_score: float
+    return_score: float
+    full_body_available: bool
+    upper_body_available: bool
+    upper_body_quiet: bool
+    missing_landmarks: tuple[str, ...]
+    torso_scale_change_ratio: float | None
+    hip_upward_score: float
+    shoulder_upward_score: float
+    ankle_upward_score: float
+    motion_coherence_score: float
+    torso_stability_score: float
+    upper_body_center_y: float | None
+    upper_body_scale: float | None
+
+    @property
+    def takeoff_score(self) -> float:
+        return max(self.full_body_score, self.upper_body_score)
+
+
+@dataclass(frozen=True, slots=True)
+class JumpEventStatus:
+    """Short take-off evidence converted into a stable observable action."""
+
+    evidence_score: float
+    evidence_frames: int
+    event_triggered: bool
+    active: bool
+    hold_remaining_s: float
+    cooldown_remaining_s: float
+    mode: str
+    phase: str
+    full_body_score: float
+    upper_body_score: float
+    return_score: float
+    missing_landmarks: tuple[str, ...]
+    torso_scale_change_ratio: float | None
+    hip_upward_score: float
+    shoulder_upward_score: float
+    ankle_upward_score: float
+    motion_coherence_score: float
+    torso_stability_score: float
+    baseline_ready: bool
+    upward_displacement_ratio: float | None
+    displacement_score: float
+    return_position_score: float
+    rejection_reason: str
+
+
+class JumpEventManager:
+    """Prefer feet evidence, with a delayed shoulder/hip fallback for crops."""
+
+    def __init__(
+        self,
+        *,
+        evidence_threshold: float = 0.55,
+        evidence_window_s: float = 0.35,
+        required_frames: int = 2,
+        hold_s: float = 0.65,
+        cooldown_s: float = 1.0,
+        upper_body_threshold: float = 0.30,
+        upper_body_strong_threshold: float = 0.45,
+        return_threshold: float = 0.25,
+        upper_body_baseline_s: float = 0.20,
+        upper_body_baseline_grace_s: float = 0.80,
+        upper_body_return_window_s: float = 1.10,
+    ) -> None:
+        self._evidence_threshold = evidence_threshold
+        self._evidence_window_s = evidence_window_s
+        self._required_frames = required_frames
+        self._hold_s = hold_s
+        self._cooldown_s = cooldown_s
+        self._upper_body_threshold = upper_body_threshold
+        self._upper_body_strong_threshold = upper_body_strong_threshold
+        self._return_threshold = return_threshold
+        self._upper_body_baseline_s = upper_body_baseline_s
+        self._upper_body_baseline_grace_s = upper_body_baseline_grace_s
+        self._upper_body_return_window_s = upper_body_return_window_s
+        self._full_body_evidence_times: deque[float] = deque()
+        self._upper_body_evidence_times: deque[float] = deque()
+        self._upper_body_takeoff_peak_score = 0.0
+        self._upper_body_quiet_since: float | None = None
+        self._upper_body_baseline_ready_until = 0.0
+        self._upper_body_baseline_center_y: float | None = None
+        self._upper_body_baseline_scale: float | None = None
+        self._awaiting_return_until = 0.0
+        self._awaiting_return_peak_ratio = 0.0
+        self._active_until = 0.0
+        self._active_mode = ""
+        self._active_evidence_score = 0.0
+        self._cooldown_until = 0.0
+        self._last_timestamp: float | None = None
+
+    def update(
+        self,
+        timestamp_s: float,
+        motion: JumpMotionEvidence,
+        *,
+        pose_detected: bool,
+    ) -> JumpEventStatus:
+        if (
+            self._last_timestamp is not None
+            and timestamp_s <= self._last_timestamp
+        ):
+            self.reset()
+        self._last_timestamp = timestamp_s
+        for evidence_times in (
+            self._full_body_evidence_times,
+            self._upper_body_evidence_times,
+        ):
+            while (
+                evidence_times
+                and timestamp_s - evidence_times[0]
+                > self._evidence_window_s
+            ):
+                evidence_times.popleft()
+        if (
+            not self._upper_body_evidence_times
+            and self._awaiting_return_until <= 0.0
+        ):
+            self._upper_body_takeoff_peak_score = 0.0
+
+        currently_active = timestamp_s < self._active_until
+        can_update_baseline = (
+            self._awaiting_return_until <= 0.0
+            and not currently_active
+            and timestamp_s >= self._cooldown_until
+        )
+        if motion.upper_body_quiet and can_update_baseline:
+            if self._upper_body_quiet_since is None:
+                self._upper_body_quiet_since = timestamp_s
+                self._upper_body_baseline_center_y = (
+                    motion.upper_body_center_y
+                )
+                self._upper_body_baseline_scale = motion.upper_body_scale
+            elif (
+                motion.upper_body_center_y is not None
+                and motion.upper_body_scale is not None
+                and self._upper_body_baseline_center_y is not None
+                and self._upper_body_baseline_scale is not None
+            ):
+                # Follow slow posture/tracking drift but freeze the reference
+                # as soon as a possible take-off begins.
+                self._upper_body_baseline_center_y = (
+                    0.8 * self._upper_body_baseline_center_y
+                    + 0.2 * motion.upper_body_center_y
+                )
+                self._upper_body_baseline_scale = (
+                    0.8 * self._upper_body_baseline_scale
+                    + 0.2 * motion.upper_body_scale
+                )
+            if (
+                timestamp_s - self._upper_body_quiet_since
+                >= self._upper_body_baseline_s
+            ):
+                self._upper_body_baseline_ready_until = (
+                    timestamp_s + self._upper_body_baseline_grace_s
+                )
+        else:
+            self._upper_body_quiet_since = None
+
+        upward_displacement_ratio: float | None = None
+        if (
+            motion.upper_body_center_y is not None
+            and self._upper_body_baseline_center_y is not None
+            and self._upper_body_baseline_scale is not None
+        ):
+            upward_displacement_ratio = (
+                self._upper_body_baseline_center_y
+                - motion.upper_body_center_y
+            ) / max(self._upper_body_baseline_scale, _EPSILON)
+        displacement_score = _classifier_high(
+            upward_displacement_ratio,
+            0.02,
+            0.07,
+        )
+        # A displacement is accepted only after some coherent upward motion;
+        # this prevents a new static crop or tracking-box shift from becoming
+        # take-off evidence by itself.
+        effective_upper_body_score = max(
+            motion.upper_body_score,
+            displacement_score if motion.upper_body_score > 0.0 else 0.0,
+        )
+        if self._awaiting_return_until > 0.0:
+            self._awaiting_return_peak_ratio = max(
+                self._awaiting_return_peak_ratio,
+                upward_displacement_ratio or 0.0,
+            )
+        return_position_score = 0.0
+        if (
+            self._awaiting_return_peak_ratio >= 0.02
+            and upward_displacement_ratio is not None
+        ):
+            return_progress = (
+                self._awaiting_return_peak_ratio
+                - upward_displacement_ratio
+            ) / max(self._awaiting_return_peak_ratio, _EPSILON)
+            return_position_score = min(
+                _classifier_high(return_progress, 0.35, 0.75),
+                _classifier_low(
+                    max(upward_displacement_ratio, 0.0),
+                    0.025,
+                    0.08,
+                ),
+            )
+        effective_return_score = max(
+            motion.return_score,
+            return_position_score,
+        )
+
+        event_triggered = False
+        rejection_reason = ""
+        triggered_mode = ""
+        if (
+            pose_detected
+            and motion.full_body_available
+            and motion.full_body_score >= self._evidence_threshold
+            and timestamp_s >= self._cooldown_until
+        ):
+            self._full_body_evidence_times.append(timestamp_s)
+            if len(self._full_body_evidence_times) >= self._required_frames:
+                event_triggered = True
+                triggered_mode = "full_body"
+
+        if not event_triggered and self._awaiting_return_until > 0.0:
+            if timestamp_s > self._awaiting_return_until:
+                self._awaiting_return_until = 0.0
+                self._awaiting_return_peak_ratio = 0.0
+                self._upper_body_takeoff_peak_score = 0.0
+                rejection_reason = "return_not_observed"
+            elif (
+                pose_detected
+                and motion.upper_body_available
+                and effective_return_score >= self._return_threshold
+                and timestamp_s >= self._cooldown_until
+            ):
+                event_triggered = True
+                triggered_mode = "upper_body_fallback"
+                self._awaiting_return_until = 0.0
+            else:
+                rejection_reason = "awaiting_return"
+
+        if (
+            not event_triggered
+            and self._awaiting_return_until <= 0.0
+            and pose_detected
+            and not motion.full_body_available
+            and motion.upper_body_available
+            and effective_upper_body_score >= self._upper_body_threshold
+            and timestamp_s >= self._cooldown_until
+        ):
+            if timestamp_s <= self._upper_body_baseline_ready_until:
+                self._upper_body_evidence_times.append(timestamp_s)
+                self._upper_body_takeoff_peak_score = max(
+                    self._upper_body_takeoff_peak_score,
+                    effective_upper_body_score,
+                )
+                if (
+                    effective_upper_body_score
+                    >= self._upper_body_strong_threshold
+                    or len(self._upper_body_evidence_times)
+                    >= self._required_frames
+                ):
+                    self._awaiting_return_until = (
+                        timestamp_s + self._upper_body_return_window_s
+                    )
+                    self._awaiting_return_peak_ratio = max(
+                        upward_displacement_ratio or 0.0,
+                        0.0,
+                    )
+                    self._upper_body_evidence_times.clear()
+                    rejection_reason = "awaiting_return"
+                else:
+                    rejection_reason = "collecting_takeoff"
+            else:
+                rejection_reason = "baseline_not_ready"
+
+        if event_triggered:
+            confirmed_evidence_score = (
+                motion.full_body_score
+                if triggered_mode == "full_body"
+                else self._upper_body_takeoff_peak_score
+            )
+            self._active_until = timestamp_s + self._hold_s
+            self._cooldown_until = timestamp_s + self._cooldown_s
+            self._active_mode = triggered_mode
+            self._active_evidence_score = confirmed_evidence_score
+            self._full_body_evidence_times.clear()
+            self._upper_body_evidence_times.clear()
+            self._awaiting_return_until = 0.0
+            self._awaiting_return_peak_ratio = 0.0
+            self._upper_body_takeoff_peak_score = 0.0
+            rejection_reason = ""
+        elif timestamp_s < self._cooldown_until:
+            rejection_reason = "cooldown"
+        elif not pose_detected:
+            rejection_reason = "pose_not_detected"
+        elif not motion.upper_body_available:
+            rejection_reason = "insufficient_upper_body"
+        elif not rejection_reason:
+            rejection_reason = (
+                "full_body_motion_insufficient"
+                if motion.full_body_available
+                else "upper_body_motion_insufficient"
+            )
+
+        active = timestamp_s < self._active_until
+        if not active and timestamp_s >= self._cooldown_until:
+            self._active_mode = ""
+            self._active_evidence_score = 0.0
+        awaiting_return = self._awaiting_return_until > 0.0
+        evidence_frames = max(
+            len(self._full_body_evidence_times),
+            len(self._upper_body_evidence_times),
+            self._required_frames if awaiting_return else 0,
+        )
+        mode = (
+            self._active_mode
+            if active
+            else "upper_body_fallback"
+            if awaiting_return or (
+                motion.upper_body_available
+                and not motion.full_body_available
+            )
+            else "unavailable"
+            if not motion.upper_body_available
+            else "full_body"
+        )
+        phase = (
+            "active"
+            if active
+            else "awaiting_return"
+            if awaiting_return
+            else "takeoff_candidate"
+            if evidence_frames
+            else "cooldown"
+            if timestamp_s < self._cooldown_until
+            else "monitoring"
+        )
+        return JumpEventStatus(
+            evidence_score=max(
+                motion.full_body_score,
+                effective_upper_body_score,
+                self._upper_body_takeoff_peak_score,
+                self._active_evidence_score if active else 0.0,
+            ),
+            evidence_frames=evidence_frames,
+            event_triggered=event_triggered,
+            active=active,
+            hold_remaining_s=max(0.0, self._active_until - timestamp_s),
+            cooldown_remaining_s=max(0.0, self._cooldown_until - timestamp_s),
+            mode=mode,
+            phase=phase,
+            full_body_score=motion.full_body_score,
+            upper_body_score=max(
+                effective_upper_body_score,
+                self._upper_body_takeoff_peak_score,
+                (
+                    self._active_evidence_score
+                    if active and self._active_mode == "upper_body_fallback"
+                    else 0.0
+                ),
+            ),
+            return_score=effective_return_score,
+            missing_landmarks=motion.missing_landmarks,
+            torso_scale_change_ratio=motion.torso_scale_change_ratio,
+            hip_upward_score=motion.hip_upward_score,
+            shoulder_upward_score=motion.shoulder_upward_score,
+            ankle_upward_score=motion.ankle_upward_score,
+            motion_coherence_score=motion.motion_coherence_score,
+            torso_stability_score=motion.torso_stability_score,
+            baseline_ready=(
+                timestamp_s <= self._upper_body_baseline_ready_until
+            ),
+            upward_displacement_ratio=upward_displacement_ratio,
+            displacement_score=displacement_score,
+            return_position_score=return_position_score,
+            rejection_reason="" if active else rejection_reason,
+        )
+
+    def reset(self) -> None:
+        self._full_body_evidence_times.clear()
+        self._upper_body_evidence_times.clear()
+        self._upper_body_takeoff_peak_score = 0.0
+        self._upper_body_quiet_since = None
+        self._upper_body_baseline_ready_until = 0.0
+        self._upper_body_baseline_center_y = None
+        self._upper_body_baseline_scale = None
+        self._awaiting_return_until = 0.0
+        self._awaiting_return_peak_ratio = 0.0
+        self._active_until = 0.0
+        self._active_mode = ""
+        self._active_evidence_score = 0.0
+        self._cooldown_until = 0.0
+        self._last_timestamp = None
+
+
+@dataclass(frozen=True, slots=True)
 class RecognizedFrame:
     analyzed: AnalyzedFrame
     actions: tuple[ActionScore, ...]
     raw_scores: tuple[tuple[ActionName, float], ...]
     fall_status: FallEventStatus
+    jump_status: JumpEventStatus
     recognition_ms: float
 
 
@@ -1718,11 +2287,52 @@ _HEAD_DOWN_NECK_FULL = -0.22
 _HEAD_DOWN_PITCH_START = 0.10
 _HEAD_DOWN_PITCH_FULL = 0.24
 _STOP_SCORE_THRESHOLD = 0.65
+_STOP_WRIST_HEIGHT_START = 0.08
+_STOP_WRIST_HEIGHT_FULL = 0.40
 
 
 class _ClassifierNormalizedPoint(Protocol):
     x: float
     y: float
+
+
+def stop_command_zone_evidence(
+    pose_landmarks: PoseLandmarkSet | None,
+    hand_landmarks: HandLandmarkSet | None,
+) -> tuple[float, float | None]:
+    """Score whether a hand is deliberately raised out of the resting zone.
+
+    The normalized height is 0 at the hip line and 1 at the shoulder line.
+    Requiring a positive value prevents a naturally hanging, straight arm from
+    satisfying the otherwise permissive elevated-camera Stop geometry.
+    """
+
+    if hand_landmarks is None or len(hand_landmarks) < 1:
+        return 0.0, None
+    shoulders = (
+        _classifier_point(pose_landmarks, 11, min_confidence=0.60),
+        _classifier_point(pose_landmarks, 12, min_confidence=0.60),
+    )
+    hips = (
+        _classifier_point(pose_landmarks, 23, min_confidence=0.60),
+        _classifier_point(pose_landmarks, 24, min_confidence=0.60),
+    )
+    if not all((*shoulders, *hips)):
+        return 0.0, None
+    shoulder_y = sum(point.y for point in shoulders if point is not None) / 2.0
+    hip_y = sum(point.y for point in hips if point is not None) / 2.0
+    torso_height = hip_y - shoulder_y
+    if torso_height <= _EPSILON:
+        return 0.0, None
+    wrist_height_ratio = (hip_y - hand_landmarks[0].y) / torso_height
+    return (
+        _classifier_high(
+            wrist_height_ratio,
+            _STOP_WRIST_HEIGHT_START,
+            _STOP_WRIST_HEIGHT_FULL,
+        ),
+        wrist_height_ratio,
+    )
 
 
 def _classifier_clamp(value: float) -> float:
@@ -1747,6 +2357,140 @@ def _classifier_low(value: float | None, full: float, end: float) -> float:
     if value >= end - _EPSILON:
         return 0.0
     return _classifier_clamp((end - value) / max(end - full, _EPSILON))
+
+
+_JUMP_LANDMARKS = {
+    11: "left_shoulder",
+    12: "right_shoulder",
+    23: "left_hip",
+    24: "right_hip",
+    27: "left_ankle",
+    28: "right_ankle",
+}
+
+
+def _jump_motion_evidence(frame: AnalyzedFrame) -> JumpMotionEvidence:
+    """Score a feet-backed jump or a cropped shoulder/hip trajectory."""
+    temporal = frame.features.temporal
+    landmarks = frame.inference.data.pose_landmarks
+    missing_landmarks = tuple(
+        name
+        for index, name in _JUMP_LANDMARKS.items()
+        if _classifier_point(landmarks, index) is None
+    )
+    hip_velocity = temporal.hip_vertical_velocity
+    shoulder_velocity = temporal.shoulder_vertical_velocity
+    ankle_velocity = temporal.ankle_vertical_velocity
+    torso_change = temporal.torso_scale_change_ratio
+    upper_body_available = (
+        hip_velocity is not None
+        and shoulder_velocity is not None
+        and torso_change is not None
+    )
+    full_body_available = hip_velocity is not None and ankle_velocity is not None
+    upper_body_points = tuple(
+        _classifier_point(landmarks, index)
+        for index in (11, 12, 23, 24)
+    )
+    upper_body_center_y = (
+        sum(point.y for point in upper_body_points if point is not None)
+        / len(upper_body_points)
+        if all(point is not None for point in upper_body_points)
+        else None
+    )
+    upper_body_scale = (
+        _temporal_pose_scale(landmarks)
+        if upper_body_center_y is not None
+        else None
+    )
+
+    hip_upward = _classifier_high(
+        -hip_velocity if hip_velocity is not None else None,
+        0.55,
+        1.40,
+    )
+    ankle_upward = _classifier_high(
+        -ankle_velocity if ankle_velocity is not None else None,
+        0.45,
+        1.20,
+    )
+    full_body_score = (
+        min(hip_upward, ankle_upward) if full_body_available else 0.0
+    )
+
+    shoulder_upward = _classifier_high(
+        -shoulder_velocity if shoulder_velocity is not None else None,
+        0.10,
+        0.70,
+    )
+    upper_hip_upward = _classifier_high(
+        -hip_velocity if hip_velocity is not None else None,
+        0.10,
+        0.70,
+    )
+    velocity_coherence = _classifier_low(
+        abs(hip_velocity - shoulder_velocity)
+        if hip_velocity is not None and shoulder_velocity is not None
+        else None,
+        0.20,
+        0.80,
+    )
+    torso_stability = _classifier_low(
+        abs(torso_change) if torso_change is not None else None,
+        0.08,
+        0.28,
+    )
+    # Never use the partial-body route to override visible planted ankles.
+    # If feet are currently measurable, their lack of upward motion is a
+    # deliberate contradiction (for example standing up or stretching).
+    upper_body_score = (
+        min(
+            upper_hip_upward,
+            shoulder_upward,
+            velocity_coherence,
+            torso_stability,
+        )
+        if upper_body_available and not full_body_available
+        else 0.0
+    )
+
+    hip_downward = _classifier_high(hip_velocity, 0.15, 0.65)
+    shoulder_downward = _classifier_high(shoulder_velocity, 0.15, 0.65)
+    return_score = (
+        min(
+            hip_downward,
+            shoulder_downward,
+            velocity_coherence,
+            torso_stability,
+        )
+        if upper_body_available and not full_body_available
+        else 0.0
+    )
+    upper_body_quiet = bool(
+        upper_body_available
+        and abs(hip_velocity) <= 0.30
+        and abs(shoulder_velocity) <= 0.30
+        and abs(torso_change) <= 0.12
+    )
+    return JumpMotionEvidence(
+        full_body_score=full_body_score,
+        upper_body_score=upper_body_score,
+        return_score=return_score,
+        full_body_available=full_body_available,
+        upper_body_available=upper_body_available,
+        upper_body_quiet=upper_body_quiet,
+        missing_landmarks=missing_landmarks,
+        torso_scale_change_ratio=torso_change,
+        hip_upward_score=(
+            upper_hip_upward if not full_body_available else hip_upward
+        ),
+        shoulder_upward_score=shoulder_upward,
+        ankle_upward_score=ankle_upward,
+        motion_coherence_score=velocity_coherence,
+        torso_stability_score=torso_stability,
+        upper_body_center_y=upper_body_center_y,
+        upper_body_scale=upper_body_scale,
+    )
 
 
 def _classifier_point(
@@ -1983,16 +2727,12 @@ class RuleActionClassifier:
             whole_arm_motion,
             wrist_reversal,
         )
-        scores[ActionName.JUMPING] = min(
-            _classifier_high(
-                -temporal.hip_vertical_velocity
-                if temporal.hip_vertical_velocity is not None
-                else None,
-                0.8,
-                2.0,
-            ),
-            _classifier_high(temporal.pose_motion_energy, 0.45, 1.2),
-        )
+        # Prefer hips + visible feet. If the crop hides the ankles, retain a
+        # stronger shoulder/hip rigid-lift candidate which must later show a
+        # downward return before JumpEventManager confirms it.
+        scores[ActionName.JUMPING] = _jump_motion_evidence(
+            frame
+        ).takeoff_score
         if RuleActionClassifier._reliable_nod_anchor(frame) is not None:
             scores[ActionName.FAST_NOD] = min(
                 _classifier_high(
@@ -2061,16 +2801,78 @@ class RuleActionClassifier:
                 (clap_cycle, 0.30),
                 (clap_zone, 0.10),
             )
-        scores[ActionName.STOMPING] = min(
-            _classifier_high(temporal.max_ankle_speed, 4.0, 8.0),
-            _classifier_high(temporal.pose_motion_energy, 0.45, 1.0),
+        ankle_cycle = min(
+            _classifier_high(
+                temporal.max_ankle_vertical_speed,
+                0.18,
+                0.90,
+            ),
+            _classifier_high(
+                temporal.ankle_vertical_range_ratio,
+                0.02,
+                0.09,
+            ),
+            _classifier_high(
+                float(temporal.ankle_vertical_direction_changes),
+                0.0,
+                1.0,
+            ),
+        )
+        knee_cycle = min(
+            _classifier_high(
+                temporal.max_knee_vertical_speed,
+                0.12,
+                0.65,
+            ),
+            _classifier_high(
+                temporal.knee_vertical_range_ratio,
+                0.015,
+                0.07,
+            ),
+            _classifier_high(
+                float(temporal.knee_vertical_direction_changes),
+                0.0,
+                1.0,
+            ),
+        )
+        ankle_cycle_available = (
+            temporal.max_ankle_vertical_speed is not None
+            and temporal.ankle_vertical_range_ratio is not None
+        )
+        lower_limb_cycle = (
+            ankle_cycle if ankle_cycle_available else knee_cycle * 0.92
+        )
+        body_center_stable = min(
             _classifier_low(
                 abs(temporal.hip_vertical_velocity)
                 if temporal.hip_vertical_velocity is not None
                 else None,
-                0.3,
-                1.3,
+                0.25,
+                0.90,
             ),
+            _classifier_low(
+                abs(temporal.shoulder_vertical_velocity)
+                if temporal.shoulder_vertical_velocity is not None
+                else None,
+                0.35,
+                1.10,
+            ),
+        )
+        standing_support = _classifier_high(
+            scores[ActionName.STANDING],
+            0.25,
+            0.65,
+        )
+        broad_motion_allowed = _classifier_low(
+            temporal.pose_motion_energy,
+            1.20,
+            2.80,
+        )
+        scores[ActionName.STOMPING] = min(
+            lower_limb_cycle,
+            body_center_stable,
+            standing_support,
+            broad_motion_allowed,
         )
         scores[ActionName.LOW_MOTION] = _classifier_low(temporal.pose_motion_energy, 0.12, 0.45)
 
@@ -2832,6 +3634,10 @@ class RuleActionClassifier:
         perspective_reach = min(foreshortened_arm, foreground_hand)
         forward_reach = max(pose_depth_reach, perspective_reach)
         straight_arm = _classifier_high(elbow_angle, 125.0, 165.0)
+        command_zone, _wrist_height_ratio = stop_command_zone_evidence(
+            pose_landmarks,
+            landmarks,
+        )
         wrist_association = _classifier_low(
             math.hypot(wrist.x - hand_wrist.x, wrist.y - hand_wrist.y) / scale,
             0.08,
@@ -2848,6 +3654,10 @@ class RuleActionClassifier:
             # geometric evidence; requiring both rejects a natural bent-elbow
             # Stop pose. The open-palm and stability gates remain mandatory.
             or max(forward_reach, straight_arm) < 0.20
+            # A straight arm by itself is common while the hand hangs beside
+            # the thigh. Stop requires the palm to be deliberately lifted
+            # above the hip line into the torso command zone.
+            or command_zone < 0.35
             or wrist_association < 0.20
             or stable_score < 0.25
             or (
@@ -2862,6 +3672,7 @@ class RuleActionClassifier:
             (palm_forward, 0.22),
             (forward_reach, 0.20),
             (straight_arm, 0.10),
+            (command_zone, 0.12),
             (wrist_association, 0.05),
             (stable_score, 0.10),
         )
@@ -2875,6 +3686,7 @@ class ActionSmoother:
         ActionName.JUMPING,
         ActionName.WAVING,
         ActionName.LARGE_ARM_SWING,
+        ActionName.STOMPING,
         ActionName.STOP_GESTURE,
         ActionName.FALL,
     }
@@ -3041,6 +3853,7 @@ class ActionRecognizer:
         self._classifier = RuleActionClassifier()
         self._smoother = ActionSmoother()
         self._fall_events = FallEventManager()
+        self._jump_events = JumpEventManager()
 
     def recognize(
         self, frame: AnalyzedFrame
@@ -3048,10 +3861,19 @@ class ActionRecognizer:
         tuple[ActionScore, ...],
         tuple[tuple[ActionName, float], ...],
         FallEventStatus,
+        JumpEventStatus,
     ]:
         raw_scores = self._classifier.classify(frame)
         timestamp_s = frame.inference.captured.monotonic_ns / 1_000_000_000.0
         pose_detected = frame.inference.data.pose_landmarks is not None
+        jump_motion = _jump_motion_evidence(frame)
+        raw_scores[ActionName.JUMPING] = jump_motion.takeoff_score
+        jump_status = self._jump_events.update(
+            timestamp_s,
+            jump_motion,
+            pose_detected=pose_detected,
+        )
+        raw_scores[ActionName.JUMPING] = 1.0 if jump_status.active else 0.0
         upright_from_not_lying = (
             _classifier_low(raw_scores[ActionName.LYING], 0.15, 0.45) if pose_detected else 0.0
         )
@@ -3098,7 +3920,7 @@ class ActionRecognizer:
                 reverse=True,
             )
         )
-        return actions, ranked_scores, fall_status
+        return actions, ranked_scores, fall_status, jump_status
 
 
 # ==============================================================================
@@ -3128,6 +3950,7 @@ class BehaviorResult:
     actions: tuple[ActionScore, ...]
     raw_scores: tuple[tuple[ActionName, float], ...]
     fall_status: FallEventStatus
+    jump_status: JumpEventStatus
     feature_ms: float
     recognition_ms: float
 
@@ -3210,7 +4033,9 @@ class BehaviorEngine:
         )
 
         recognition_started_ns = time.perf_counter_ns()
-        actions, raw_scores, fall_status = self._recognizer.recognize(analyzed)
+        actions, raw_scores, fall_status, jump_status = (
+            self._recognizer.recognize(analyzed)
+        )
         recognition_ms = (time.perf_counter_ns() - recognition_started_ns) / 1_000_000.0
         return BehaviorResult(
             frame=frame,
@@ -3218,6 +4043,7 @@ class BehaviorEngine:
             actions=actions,
             raw_scores=raw_scores,
             fall_status=fall_status,
+            jump_status=jump_status,
             feature_ms=feature_ms,
             recognition_ms=recognition_ms,
         )

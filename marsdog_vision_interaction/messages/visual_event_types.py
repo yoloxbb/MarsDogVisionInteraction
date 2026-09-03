@@ -17,6 +17,8 @@ EVT_VISION_ANIMAL_BOUNDARY = "EVT_VISION_ANIMAL_BOUNDARY"
 _SPECIAL_ACTION_EVENTS = {
     "fallen_down": EVT_VISION_FALL,
     "stop_gesture": EVT_VISION_STOP_GESTURE,
+    "holding_toy": EVT_VISION_TOY,
+    "holding_dog_food": EVT_VISION_FOOD,
 }
 
 _ACTION_EMOTION = {
@@ -26,6 +28,7 @@ _ACTION_EMOTION = {
     "nodding": "happy",
     "clapping": "happy",
     "thumbs_up": "happy",
+    "victory": "happy",
     "hands_on_hips": "sad",
     "rapid_wave_slap": "sad",
     "finger_pointing": "sad",
@@ -59,11 +62,3 @@ def face_identity_to_vision_event(identity: str) -> str:
         if identity and identity != "unknown"
         else EVT_VISION_STRANGER
     )
-
-
-def object_to_vision_event(label: str) -> str:
-    if label in {"dog bowl", "dog food can", "dog treat bag"}:
-        return EVT_VISION_FOOD
-    if label in {"dog toy ball", "dog frisbee toy", "dog tug ring toy"}:
-        return EVT_VISION_TOY
-    return ""

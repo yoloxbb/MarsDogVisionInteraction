@@ -9,6 +9,9 @@ from marsdog_vision_interaction.core.face_enrollment_manager import (
     FaceEnrollmentManager,
     set_storage_root,
 )
+from marsdog_vision_interaction.core.held_object_pose import (
+    HeldObjectPoseStatus,
+)
 from marsdog_vision_interaction.core.object_detection_session import (
     ObjectDetectionSessionManager,
 )
@@ -24,6 +27,10 @@ from marsdog_vision_interaction.nodes.vision_debug_viewer_node import (
 from marsdog_vision_interaction.providers.object_detector import ObjectDetectorProvider
 from marsdog_vision_interaction.providers.face_recognition import (
     FaceRecognitionProvider,
+)
+from marsdog_vision_interaction.providers import (
+    face_recognition as face_recognition_module,
+    vision_observation as vision_observation_module,
 )
 from marsdog_vision_interaction.providers.vision_observation import (
     VisionObservationProvider,
@@ -69,7 +76,33 @@ class _FakeLandmarker:
         return "video-result"
 
 
-def test_stale_camera_does_not_refresh_cached_target() -> None:
+class _FakeFaceDetector:
+    def setInputSize(self, size) -> None:
+        self.size = size
+
+    def detect(self, frame):
+        _ = frame
+        detection = np.array([
+            2, 3, 20, 24,
+            5, 6, 15, 6, 10, 11, 6, 19, 15, 19,
+            0.95,
+        ], dtype=np.float32)
+        return None, np.array([detection], dtype=np.float32)
+
+
+class _FakeFaceTracker:
+    def update(self, xyxy, scores):
+        _ = scores
+        return np.arange(1, len(xyxy) + 1, dtype=np.int64)
+
+
+def test_stale_camera_does_not_refresh_cached_target(monkeypatch) -> None:
+    timing_traces = []
+    monkeypatch.setattr(
+        vision_node_module,
+        "vision_timing_trace",
+        lambda **fields: timing_traces.append(fields),
+    )
     manager = VisualTargetManager()
     manager.update_vision([{
         "x": 0.2, "y": 0.1, "w": 0.4, "h": 0.8,
@@ -100,6 +133,16 @@ def test_stale_camera_does_not_refresh_cached_target() -> None:
     assert payload["humans"] == []
     assert payload["active_target"]["tracking_state"] == "temporarily_lost"
     assert payload["active_target"]["last_seen_age_ms"] >= 900.0
+    assert any(
+        item["module"] == "depth_fusion"
+        and item["stage"] == "aligned_depth_range"
+        for item in timing_traces
+    )
+    assert any(
+        item["module"] == "visual_event"
+        and item["stage"] == "event_publish"
+        for item in timing_traces
+    )
 
 
 def test_mono_task_frame_is_not_cropped() -> None:
@@ -117,6 +160,39 @@ def test_mono_task_frame_is_not_cropped() -> None:
     selected = VisionInteractionNode._frame_for_tasks(fake_node)
     assert selected is not None
     assert selected.shape == (480, 640, 3)
+
+
+def test_face_detector_and_tracker_emit_separate_stage_timings(
+    monkeypatch,
+) -> None:
+    traces = []
+    monkeypatch.setattr(
+        vision_observation_module,
+        "vision_timing_trace",
+        lambda **fields: traces.append(fields),
+    )
+    provider = VisionObservationProvider({"face_tracking": {}})
+    provider._face_detector = _FakeFaceDetector()
+    provider._face_tracker = _FakeFaceTracker()
+
+    faces = provider._detect_faces(
+        np.zeros((40, 40, 3), dtype=np.uint8),
+        40,
+        40,
+        inference_sequence=9,
+    )
+
+    assert len(faces) == 1
+    assert faces[0]["track_id"] == 1
+    assert [item["module"] for item in traces] == [
+        "face_detection",
+        "face_tracking",
+    ]
+    assert traces[0]["stage"] == "yunet_inference"
+    assert traces[0]["detection_count"] == 1
+    assert traces[1]["stage"] == "bytetrack_update"
+    assert traces[1]["track_count"] == 1
+    assert all(item["inference_sequence"] == 9 for item in traces)
 
 
 def test_real_provider_uses_latest_eligible_frame_without_callback_blocking() -> None:
@@ -648,7 +724,13 @@ def test_face_enrollment_default_collects_three_continuous_shots(tmp_path) -> No
     assert manager.face_session.poses == ["continuous"] * 3
 
 
-def test_face_recognition_keeps_and_matches_multiple_templates() -> None:
+def test_face_recognition_keeps_and_matches_multiple_templates(monkeypatch) -> None:
+    timing_traces = []
+    monkeypatch.setattr(
+        face_recognition_module,
+        "vision_timing_trace",
+        lambda **fields: timing_traces.append(fields),
+    )
     provider = FaceRecognitionProvider({"match_threshold": 0.5})
     embeddings = iter([
         np.array([1.0, 0.0], dtype=np.float32),
@@ -664,6 +746,9 @@ def test_face_recognition_keeps_and_matches_multiple_templates() -> None:
     assert result["matched"] is True
     assert result["user_id"] == "owner"
     assert result["confidence"] == 1.0
+    assert timing_traces[-1]["module"] == "face_recognition"
+    assert timing_traces[-1]["stage"] == "sface_task_recognize"
+    assert timing_traces[-1]["reason_code"] == "matched"
 
 
 def test_master_pose_event_requires_confirmed_known_identity() -> None:
@@ -689,6 +774,31 @@ def test_master_pose_event_requires_confirmed_known_identity() -> None:
     assert VisionInteractionNode._derive_events(confirmed) == [
         "EVT_VISION_MASTER",
         "EVT_VISION_MASTER_HAPPY",
+    ]
+
+
+def test_victory_hand_publishes_happy_only_after_identity_confirmation() -> None:
+    candidate = {
+        "faces": [],
+        "hands": [{"hand_action": "victory"}],
+        "active_target": {
+            "identity": "owner",
+            "identity_state": "candidate_known",
+            "tracking_state": "tracking",
+            "pose_action": "",
+        },
+    }
+    assert VisionInteractionNode._derive_events(candidate) == []
+
+    confirmed = {
+        **candidate,
+        "active_target": {
+            **candidate["active_target"],
+            "identity_state": "confirmed_known",
+        },
+    }
+    assert VisionInteractionNode._derive_events(confirmed) == [
+        "EVT_VISION_MASTER_HAPPY"
     ]
 
 
@@ -770,6 +880,218 @@ def test_all_pose_events_require_fixed_confirmed_face_identity() -> None:
     assert VisionInteractionNode._derive_events(legacy_identity) == []
 
 
+def test_held_object_pose_reuses_toy_food_events_with_identity_gate() -> None:
+    object_only = {
+        "faces": [],
+        "hands": [],
+        "tracked_objects": [{"label": "dog toy ball"}],
+        "active_target": {
+            "identity": "unknown",
+            "identity_state": "confirmed_unknown",
+            "tracking_state": "tracking",
+            "pose_action": "",
+        },
+    }
+    assert VisionInteractionNode._derive_events(object_only) == []
+
+    holding_toy = {
+        **object_only,
+        "faces": [{"recognized_user": "owner"}],
+        "active_target": {
+            **object_only["active_target"],
+            "identity": "owner",
+            "identity_state": "confirmed_known",
+            "pose_action": "holding_toy",
+        },
+    }
+    assert VisionInteractionNode._derive_events(holding_toy) == [
+        "EVT_VISION_MASTER",
+        "EVT_VISION_TOY",
+    ]
+    holding_food = {
+        **holding_toy,
+        "active_target": {
+            **holding_toy["active_target"],
+            "pose_action": "holding_dog_food",
+        },
+    }
+    assert VisionInteractionNode._derive_events(holding_food) == [
+        "EVT_VISION_MASTER",
+        "EVT_VISION_FOOD",
+    ]
+
+
+def test_held_object_pose_updates_only_matching_person_and_preserves_fall() -> None:
+    event = {
+        "active_target": {
+            "target_id": "epoch:human:7",
+            "track_id": 7,
+            "pose_action": "neutral_stand_sit",
+        },
+        "human_candidates": [
+            {"target_id": "epoch:human:7", "pose_action": ""},
+            {"target_id": "epoch:human:8", "pose_action": ""},
+        ],
+        "humans": [
+            {"track_id": 7, "pose_action": ""},
+            {"track_id": 8, "pose_action": ""},
+        ],
+    }
+    status = HeldObjectPoseStatus(
+        state="confirmed",
+        action="holding_toy",
+        action_label="手持玩具",
+        candidate_action="holding_toy",
+        object_label="dog toy ball",
+        object_track_id=3,
+        hand_source="pose_left_wrist",
+        association_score=0.9,
+        wrist_distance_ratio=0.01,
+    )
+    VisionInteractionNode._apply_held_object_pose(event, status)
+
+    assert event["active_target"]["pose_action"] == "holding_toy"
+    assert event["human_candidates"][0]["pose_action"] == "holding_toy"
+    assert event["human_candidates"][1]["pose_action"] == ""
+    assert event["humans"][0]["pose_action"] == "holding_toy"
+    assert event["humans"][1]["pose_action"] == ""
+    assert event["active_target"]["held_object"]["object_track_id"] == 3
+
+    event["active_target"]["pose_action"] = "fallen_down"
+    VisionInteractionNode._apply_held_object_pose(event, status)
+    assert event["active_target"]["pose_action"] == "fallen_down"
+
+
+def test_human_visibility_controls_preemptible_held_object_stream() -> None:
+    manager = ObjectDetectionSessionManager(
+        default_rate_hz=2.0,
+        max_rate_hz=5.0,
+        default_lease_sec=5.0,
+        max_lease_sec=30.0,
+    )
+    node = SimpleNamespace(
+        _held_object_stream=manager,
+        _held_object_enabled=True,
+        _providers={"object": SimpleNamespace(
+            is_available=lambda: True
+        )},
+        _held_object_session_id="vision-human-holding",
+        _held_object_rate_hz=2.0,
+        _held_object_confidence=0.35,
+        _held_object_last_human_at=0.0,
+        _held_object_absence_grace_sec=2.0,
+    )
+    visible = {
+        "active_target": {
+            "tracking_state": "tracking",
+            "confidence": 0.9,
+        },
+    }
+    VisionInteractionNode._update_held_object_stream(node, visible, 10.0)
+    snapshot = manager.snapshot(now=10.0)
+    assert snapshot["active"] is True
+    assert snapshot["session_id"] == "vision-human-holding"
+    assert snapshot["rate_hz"] == 2.0
+
+    lost = {"active_target": {"tracking_state": "temporarily_lost"}}
+    VisionInteractionNode._update_held_object_stream(node, lost, 11.9)
+    assert manager.snapshot(now=11.9)["active"] is True
+    VisionInteractionNode._update_held_object_stream(node, lost, 12.0)
+    assert manager.snapshot(now=12.0)["active"] is False
+
+
+def test_human_loss_publishes_automatic_stream_terminal_state() -> None:
+    context = ObjectDetectionSessionManager(default_lease_sec=5.0)
+    external = ObjectDetectionSessionManager(default_lease_sec=5.0)
+    records = []
+    node = SimpleNamespace(
+        _held_object_stream=context,
+        _object_stream=external,
+        _held_object_enabled=True,
+        _providers={"object": SimpleNamespace(is_available=lambda: True)},
+        _held_object_session_id="vision-human-holding",
+        _held_object_rate_hz=2.0,
+        _held_object_confidence=0.35,
+        _held_object_last_human_at=10.0,
+        _held_object_absence_grace_sec=2.0,
+        _record_object_result=lambda objects, **kwargs: records.append(
+            (objects, kwargs)
+        ),
+    )
+    context.configure({
+        "enabled": True,
+        "session_id": "vision-human-holding",
+        "lease_sec": 5.0,
+    }, now=10.0)
+
+    VisionInteractionNode._update_held_object_stream(
+        node,
+        {"active_target": {"tracking_state": "temporarily_lost"}},
+        12.0,
+    )
+
+    assert context.snapshot(now=12.0)["active"] is False
+    assert len(records) == 1
+    assert records[0][1]["status"] == "stopped"
+    assert records[0][1]["stop_reason"] == "human_absent"
+    assert records[0][1]["stream"]["active"] is False
+
+
+def test_object_state_keeps_automatic_stream_separate_from_external_owner() -> None:
+    external = ObjectDetectionSessionManager(default_lease_sec=5.0)
+    context = ObjectDetectionSessionManager(default_lease_sec=5.0)
+    context.configure({
+        "enabled": True,
+        "session_id": "vision-human-holding",
+        "lease_sec": 5.0,
+    })
+    node = SimpleNamespace(
+        _object_stream=external,
+        _held_object_stream=context,
+        _providers={},
+    )
+
+    result = VisionInteractionNode._run_task(
+        node,
+        "get_object_detection_state",
+        {},
+    )
+
+    assert result["stream"]["active"] is False
+    assert result["automatic_stream"]["active"] is True
+    assert result["automatic_stream"]["session_id"] == "vision-human-holding"
+
+
+def test_explicit_object_stream_runs_before_held_pose_stream() -> None:
+    explicit = ObjectDetectionSessionManager()
+    context = ObjectDetectionSessionManager()
+    now = time.monotonic()
+    explicit.configure({
+        "enabled": True,
+        "session_id": "action-find-toy",
+        "lease_sec": 3.0,
+    }, now=now)
+    context.configure({
+        "enabled": True,
+        "session_id": "vision-human-holding",
+        "lease_sec": 3.0,
+    }, now=now)
+    calls = []
+    node = SimpleNamespace(
+        _object_stream=explicit,
+        _held_object_stream=context,
+        _run_object_detection=lambda params, **kwargs: (
+            calls.append((params, kwargs)) or {"ok": True}
+        ),
+    )
+
+    # Both streams are immediately due, but the externally owned Action stream
+    # is authoritative and consumes the only inference slot.
+    VisionInteractionNode._poll_objects(node)
+    assert len(calls) == 1
+    assert calls[0][1]["stream"]["session_id"] == "action-find-toy"
+
+
 def test_visual_state_log_reports_gate_and_deduplicates(monkeypatch) -> None:
     messages = []
     monkeypatch.setattr(
@@ -802,3 +1124,40 @@ def test_visual_state_log_reports_gate_and_deduplicates(monkeypatch) -> None:
     assert len(messages) == 2
     assert "pose_event_gate=open" in messages[1]
     assert "EVT_VISION_MASTER_HAPPY" in messages[1]
+
+
+def test_visual_state_trace_reports_publish_and_suppression(monkeypatch) -> None:
+    traces = []
+    monkeypatch.setattr(
+        vision_node_module,
+        "vision_trace",
+        lambda record, **fields: traces.append((record, fields)),
+    )
+    node = SimpleNamespace(
+        _last_visual_log_signature=None,
+        _last_traced_events=(),
+    )
+    event = {
+        "vision_epoch": "epoch-1",
+        "sequence": 17,
+        "snapshot_id": "epoch-1:17",
+        "active_target": {
+            "track_id": 7,
+            "tracking_state": "tracking",
+            "identity": "owner",
+            "identity_state": "candidate_known",
+            "pose_action": "stop_gesture",
+        },
+        "hands": [],
+        "events": [],
+    }
+    VisionInteractionNode._log_visual_event_state(node, event)
+    assert traces[-1][0] == "event_suppressed"
+    assert traces[-1][1]["reason_code"] == "identity_not_confirmed"
+
+    event["active_target"]["identity_state"] = "confirmed_known"
+    event["events"] = ["EVT_VISION_STOP_GESTURE"]
+    VisionInteractionNode._log_visual_event_state(node, event)
+    published = [fields for record, fields in traces if record == "event_publish"]
+    assert published[-1]["event_type"] == "EVT_VISION_STOP_GESTURE"
+    assert published[-1]["sequence"] == 17

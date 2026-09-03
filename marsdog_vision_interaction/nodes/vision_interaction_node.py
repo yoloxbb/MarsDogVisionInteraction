@@ -30,6 +30,11 @@ from marsdog_vision_interaction.core.face_enrollment_manager import (
     FaceEnrollmentManager,
     set_storage_root,
 )
+from marsdog_vision_interaction.core.held_object_pose import (
+    HELD_OBJECT_LABELS,
+    HeldObjectPoseManager,
+    HeldObjectPoseStatus,
+)
 from marsdog_vision_interaction.core.object_detection_session import (
     ObjectDetectionSessionManager,
 )
@@ -42,14 +47,16 @@ from marsdog_vision_interaction.messages.visual_event import (
 )
 from marsdog_vision_interaction.messages.visual_event_types import (
     face_identity_to_vision_event,
-    object_to_vision_event,
     pose_action_to_vision_event,
 )
 from marsdog_vision_interaction.providers.base import BaseProvider
 from marsdog_vision_interaction.utils.config_loader import load_config
 from marsdog_vision_interaction.utils.logging_utils import (
+    configure_event_trace,
     get_logger,
     setup_logging,
+    vision_timing_trace,
+    vision_trace,
 )
 from marsdog_vision_interaction.utils.stereo_view import select_camera_view
 
@@ -88,6 +95,8 @@ class VisionInteractionNode(Node):
         self.declare_parameter("config_path", "config/vision.yaml")
         self.declare_parameter("log_level", "INFO")
         self.declare_parameter("log_dir", "log")
+        self.declare_parameter("test_run_id", "")
+        self.declare_parameter("test_case_id", "")
         self.declare_parameter("pose_model_variant", "")
         self.declare_parameter("landmarker_running_mode", "")
         self.declare_parameter("face_api_host", "")
@@ -103,6 +112,20 @@ class VisionInteractionNode(Node):
         except Exception as exc:
             logger.error("Cannot load vision config %s: %s", config_path, exc)
             self._config = {}
+        logging_config = self._config.get("logging", {})
+        if not isinstance(logging_config, dict):
+            logging_config = {}
+        self._timing_trace_interval_sec = max(
+            0.0,
+            float(logging_config.get("timing_trace_interval_sec", 5.0)),
+        )
+        configure_event_trace(
+            enabled=bool(logging_config.get("event_trace", True)),
+            log_dir=str(self.get_parameter("log_dir").value),
+            run_id=str(self.get_parameter("test_run_id").value),
+            case_id=str(self.get_parameter("test_case_id").value),
+            timing_interval_sec=self._timing_trace_interval_sec,
+        )
         self._apply_runtime_model_overrides()
         self._apply_face_api_overrides()
 
@@ -125,6 +148,8 @@ class VisionInteractionNode(Node):
         self._latest_visual_snapshot: dict[str, Any] = {}
         self._latest_visual_snapshot_monotonic = 0.0
         self._last_visual_log_signature: tuple[Any, ...] | None = None
+        self._last_traced_held_signature: tuple[Any, ...] | None = None
+        self._last_traced_events: tuple[str, ...] = ()
         self._state_lock = threading.Lock()
         self._enrollment_lock = threading.RLock()
         self._camera_callback_group = MutuallyExclusiveCallbackGroup()
@@ -321,6 +346,59 @@ class VisionInteractionNode(Node):
                 object_runtime_config.get("max_lease_sec", 30.0)
             ),
         )
+        self._held_object_enabled = bool(
+            object_runtime_config.get("held_pose_enabled", True)
+        )
+        self._held_object_rate_hz = min(
+            float(object_runtime_config.get("max_inference_rate_hz", 5.0)),
+            max(0.1, float(
+                object_runtime_config.get("held_pose_rate_hz", 2.0)
+            )),
+        )
+        self._held_object_confidence = min(
+            1.0,
+            max(0.0, float(
+                object_runtime_config.get("held_pose_confidence", 0.35)
+            )),
+        )
+        self._held_object_absence_grace_sec = max(
+            0.0,
+            float(object_runtime_config.get(
+                "held_pose_human_absence_grace_sec", 2.0
+            )),
+        )
+        self._held_object_session_id = "vision-human-holding"
+        self._held_object_stream = ObjectDetectionSessionManager(
+            default_rate_hz=self._held_object_rate_hz,
+            max_rate_hz=float(
+                object_runtime_config.get("max_inference_rate_hz", 5.0)
+            ),
+            default_confidence=self._held_object_confidence,
+            default_lease_sec=5.0,
+            max_lease_sec=30.0,
+        )
+        self._held_object_pose = HeldObjectPoseManager(
+            min_object_confidence=self._held_object_confidence,
+            wrist_distance_ratio=float(object_runtime_config.get(
+                "held_pose_wrist_distance_ratio", 0.16
+            )),
+            human_bbox_expansion_ratio=float(object_runtime_config.get(
+                "held_pose_human_bbox_expansion_ratio", 0.15
+            )),
+            required_hits=int(object_runtime_config.get(
+                "held_pose_confirmation_hits", 2
+            )),
+            confirmation_window_s=float(object_runtime_config.get(
+                "held_pose_confirmation_window_sec", 1.5
+            )),
+            hold_s=float(object_runtime_config.get(
+                "held_pose_hold_sec", 1.25
+            )),
+            max_pose_object_sync_delta_s=float(object_runtime_config.get(
+                "held_pose_max_sync_delta_sec", 0.75
+            )),
+        )
+        self._held_object_last_human_at = 0.0
         object_scheduler_rate_hz = max(
             1.0,
             float(object_runtime_config.get("scheduler_rate_hz", 20.0)),
@@ -392,13 +470,27 @@ class VisionInteractionNode(Node):
         )
         logger.info(
             "Vision node ready: camera=%s visual=%s objects=%s startup=%.2fHz "
-            "depth=%s service=%s",
+            "held_pose=%s@%.2fHz depth=%s service=%s",
             self._camera_topic,
             self._visual_topic,
             self._object_topic,
             self._object_inference_rate_hz,
+            self._held_object_enabled,
+            self._held_object_rate_hz,
             self._depth_topic if self._depth_enabled else "disabled",
             service_name if self._service is not None else "unavailable",
+        )
+        vision_trace(
+            "runtime_start",
+            result="ready",
+            node="vision_interaction",
+            module="runtime",
+            camera_topic=self._camera_topic,
+            visual_topic=self._visual_topic,
+            object_topic=self._object_topic,
+            service=service_name if self._service is not None else "unavailable",
+            vision_epoch=self._vision_epoch,
+            timing_trace_interval_sec=self._timing_trace_interval_sec,
         )
 
     def _apply_runtime_model_overrides(self) -> None:
@@ -908,6 +1000,42 @@ class VisionInteractionNode(Node):
         *,
         observation_stamp: float,
     ) -> None:
+        """Measure one complete aligned-depth fusion attempt."""
+        started = time.perf_counter()
+        result = (
+            "success"
+            if bool(getattr(self, "_depth_enabled", False))
+            else "skipped"
+        )
+        try:
+            VisionInteractionNode._fuse_human_depth_impl(
+                self,
+                candidates,
+                observation_stamp=observation_stamp,
+            )
+        except Exception:
+            result = "failure"
+            raise
+        finally:
+            vision_timing_trace(
+                node="vision_interaction",
+                module="depth_fusion",
+                stage="aligned_depth_range",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                result=result,
+                observation_stamp=round(float(observation_stamp), 6),
+                candidate_count=len(candidates),
+                fused_count=sum(
+                    1 for item in candidates if item.get("range_valid") is True
+                ),
+            )
+
+    def _fuse_human_depth_impl(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        observation_stamp: float,
+    ) -> None:
         """Fill ranges from an aligned depth image, otherwise fail closed."""
         for candidate in candidates:
             candidate["range_valid"] = False
@@ -1138,6 +1266,9 @@ class VisionInteractionNode(Node):
             latest_camera_monotonic = self._latest_camera_monotonic
             latest_objects_monotonic = self._latest_objects_monotonic
             latest_objects = [dict(item) for item in self._latest_objects]
+            object_result_sequence = int(
+                getattr(self, "_object_sequence", 0)
+            )
         camera_fresh = (
             self._vision_is_mock
             or (
@@ -1165,17 +1296,56 @@ class VisionInteractionNode(Node):
             raw = dict(raw)
             raw["tracked_objects"] = latest_objects
         event = VisionInteractionNode._build_visual_snapshot(self, raw)
+        held_manager = getattr(self, "_held_object_pose", None)
+        if held_manager is not None:
+            held_status = held_manager.update(
+                now=now,
+                active_target=event.get("active_target", {}),
+                hands=event.get("hands", []),
+                objects=event.get("tracked_objects", []),
+                object_result_sequence=object_result_sequence,
+                pose_observation_stamp=event.get("header", {}).get("stamp"),
+            )
+            VisionInteractionNode._apply_held_object_pose(
+                event,
+                held_status,
+            )
+        VisionInteractionNode._update_held_object_stream(self, event, now)
         event["events"] = self._derive_events(event)
-        VisionInteractionNode._log_visual_event_state(self, event)
         # Cache exactly the complete packet that is published.  VisionTask
         # query_targets only ever copies this atomic snapshot; it never
         # rebuilds target IDs from unrelated caches.
         with self._state_lock:
             self._latest_visual_snapshot = copy.deepcopy(event)
             self._latest_visual_snapshot_monotonic = time.monotonic()
-        message = String()
-        message.data = json.dumps(event, ensure_ascii=False)
-        self._visual_pub.publish(message)
+        publish_started = time.perf_counter()
+        try:
+            message = String()
+            message.data = json.dumps(event, ensure_ascii=False)
+            self._visual_pub.publish(message)
+        except Exception:
+            vision_timing_trace(
+                node="vision_interaction",
+                module="visual_event",
+                stage="event_publish",
+                latency_ms=(time.perf_counter() - publish_started) * 1000.0,
+                result="failure",
+                force=True,
+                sequence=int(event.get("sequence", 0) or 0),
+                event_count=len(event.get("events", [])),
+            )
+            raise
+        publish_latency_ms = (time.perf_counter() - publish_started) * 1000.0
+        vision_timing_trace(
+            node="vision_interaction",
+            module="visual_event",
+            stage="event_publish",
+            latency_ms=publish_latency_ms,
+            sequence=int(event.get("sequence", 0) or 0),
+            event_count=len(event.get("events", [])),
+            events=list(event.get("events", [])),
+        )
+        VisionInteractionNode._log_visual_event_state(self, event)
 
     def _log_visual_event_state(self, event: dict[str, Any]) -> None:
         """Log identity, action gating and emitted events on state changes."""
@@ -1196,6 +1366,16 @@ class VisionInteractionNode(Node):
             active.get("identity_state", "unverified") or "unverified"
         )
         pose_action = str(active.get("pose_action", "") or "")
+        held_object = active.get("held_object", {})
+        if not isinstance(held_object, dict):
+            held_object = {}
+        held_signature = (
+            str(held_object.get("state", "inactive")),
+            str(held_object.get("action", "")),
+            str(held_object.get("object_label", "")),
+            str(held_object.get("rejection_reason", "")),
+            int(held_object.get("object_result_sequence", 0) or 0),
+        )
         signature = (
             int(active.get("track_id", 0) or 0),
             str(active.get("tracking_state", "lost")),
@@ -1203,6 +1383,7 @@ class VisionInteractionNode(Node):
             identity_state,
             pose_action,
             hand_actions,
+            held_signature,
             events,
         )
         if signature == getattr(self, "_last_visual_log_signature", None):
@@ -1218,16 +1399,91 @@ class VisionInteractionNode(Node):
             gate = "idle"
         logger.info(
             "Visual state changed: track=%s tracking=%s identity=%s "
-            "identity_state=%s pose=%s hands=%s pose_event_gate=%s events=%s",
+            "identity_state=%s pose=%s hands=%s held=%s:%s:%s/%s:%.3f:%s "
+            "pose_event_gate=%s events=%s",
             signature[0],
             signature[1],
             identity,
             identity_state,
             pose_action or "-",
             ",".join(hand_actions) or "-",
+            held_signature[0],
+            str(held_object.get("object_label", "")) or "-",
+            int(held_object.get("evidence_hits", 0) or 0),
+            int(held_object.get("required_hits", 2) or 2),
+            float(held_object.get("association_score", 0.0) or 0.0),
+            str(held_object.get("rejection_reason", "")) or "-",
             gate,
             ",".join(events) or "-",
         )
+        trace_common = {
+            "node": "vision_interaction",
+            "module": "visual_event",
+            "vision_epoch": str(event.get("vision_epoch", "")),
+            "sequence": int(event.get("sequence", 0) or 0),
+            "snapshot_id": str(event.get("snapshot_id", "")),
+            "track_id": signature[0],
+            "tracking_state": signature[1],
+            "identity": identity,
+            "identity_state": identity_state,
+            "pose_action": pose_action,
+            "hand_actions": list(hand_actions),
+            "pose_event_gate": gate,
+        }
+        if held_signature != getattr(self, "_last_traced_held_signature", None):
+            vision_trace(
+                "held_object_evaluation",
+                result=str(held_object.get("state", "inactive")),
+                reason_code=str(held_object.get("rejection_reason", "")),
+                candidate_action=str(held_object.get("candidate_action", "")),
+                action=str(held_object.get("action", "")),
+                object_label=str(held_object.get("evaluated_object_label", "")),
+                object_confidence=float(
+                    held_object.get("evaluated_object_confidence", 0.0) or 0.0
+                ),
+                valid_wrist_count=int(
+                    held_object.get("valid_wrist_count", 0) or 0
+                ),
+                pose_object_sync_delta_ms=held_object.get(
+                    "pose_object_sync_delta_ms"
+                ),
+                wrist_distance_ratio=held_object.get(
+                    "evaluated_wrist_distance_ratio"
+                ),
+                wrist_distance_threshold_ratio=float(
+                    held_object.get("wrist_distance_threshold_ratio", 0.0) or 0.0
+                ),
+                evidence_hits=int(held_object.get("evidence_hits", 0) or 0),
+                required_hits=int(held_object.get("required_hits", 2) or 2),
+                object_result_sequence=int(
+                    held_object.get("object_result_sequence", 0) or 0
+                ),
+                **trace_common,
+            )
+            self._last_traced_held_signature = held_signature
+        previous_events = set(getattr(self, "_last_traced_events", ()))
+        current_events = set(events)
+        for event_type in sorted(current_events - previous_events):
+            vision_trace(
+                "event_publish", result="published", event_type=event_type,
+                **trace_common,
+            )
+        for event_type in sorted(previous_events - current_events):
+            vision_trace(
+                "event_cleared", result="cleared", event_type=event_type,
+                **trace_common,
+            )
+        if gate == "blocked" and (pose_action or hand_actions):
+            reason = (
+                "target_not_tracking"
+                if signature[1] != "tracking"
+                else "identity_not_confirmed"
+            )
+            vision_trace(
+                "event_suppressed", result="blocked", reason_code=reason,
+                **trace_common,
+            )
+        self._last_traced_events = events
 
     def _publish_gesture_debug(self, raw: dict[str, Any]) -> None:
         """Publish exact engine labels without changing the stable visual contract."""
@@ -1257,9 +1513,14 @@ class VisionInteractionNode(Node):
         self._gesture_debug_pub.publish(message)
 
     def _poll_objects(self) -> None:
-        """Advance the on-demand stream and run one due inference."""
+        """Run an explicit stream, or the lower-priority held-pose stream."""
         decision = self._object_stream.poll()
         state = str(decision.get("state", "inactive"))
+        if state == "inactive":
+            context_stream = getattr(self, "_held_object_stream", None)
+            if context_stream is not None:
+                decision = context_stream.poll()
+                state = str(decision.get("state", "inactive"))
         if state == "expired":
             self._record_object_result(
                 [],
@@ -1289,6 +1550,145 @@ class VisionInteractionNode(Node):
                 "Object stream inference skipped: %s",
                 result.get("error"),
             )
+
+    def _effective_object_stream_snapshot(self) -> dict[str, Any]:
+        """Prefer the externally owned stream, then the automatic context."""
+        stream = self._object_stream.snapshot()
+        if stream.get("active"):
+            return stream
+        context_stream = getattr(self, "_held_object_stream", None)
+        return (
+            context_stream.snapshot()
+            if context_stream is not None
+            else stream
+        )
+
+    def _update_held_object_stream(
+        self,
+        event: dict[str, Any],
+        now: float,
+    ) -> None:
+        """Enable 2 Hz object sampling only while a human remains visible."""
+        context_stream = getattr(self, "_held_object_stream", None)
+        if context_stream is None or not getattr(
+            self, "_held_object_enabled", False
+        ):
+            return
+        detector = self._providers.get("object")
+        if detector is None or not detector.is_available():
+            return
+        active = event.get("active_target", {})
+        human_visible = (
+            isinstance(active, dict)
+            and str(active.get("tracking_state", "")) == "tracking"
+            and float(active.get("confidence", 0.0) or 0.0) > 0.0
+        )
+        if human_visible:
+            self._held_object_last_human_at = now
+            snapshot = context_stream.snapshot(now=now)
+            remaining = snapshot.get("lease_remaining_sec")
+            if (
+                not snapshot.get("active")
+                or remaining is None
+                or float(remaining) < 1.0
+            ):
+                result = context_stream.configure({
+                    "enabled": True,
+                    "session_id": self._held_object_session_id,
+                    "rate_hz": self._held_object_rate_hz,
+                    "confidence": self._held_object_confidence,
+                    "target_labels": list(HELD_OBJECT_LABELS),
+                    "lease_sec": 5.0,
+                }, now=now)
+                if result.get("ok") and not snapshot.get("active"):
+                    logger.info(
+                        "Held-object detection started: session=%s rate=%.2fHz",
+                        self._held_object_session_id,
+                        self._held_object_rate_hz,
+                    )
+            return
+        last_human_at = float(
+            getattr(self, "_held_object_last_human_at", 0.0)
+        )
+        if (
+            (context_snapshot := context_stream.snapshot(now=now)).get("active")
+            and (
+                last_human_at <= 0.0
+                or now - last_human_at
+                >= self._held_object_absence_grace_sec
+            )
+        ):
+            result = context_stream.configure({
+                "enabled": False,
+                "session_id": self._held_object_session_id,
+            }, now=now)
+            if result.get("ok"):
+                logger.info(
+                    "Held-object detection stopped: session=%s reason=human_absent",
+                    self._held_object_session_id,
+                )
+                # If no external Action/debug stream owns the detector, publish
+                # a terminal packet so the dashboard cannot retain a stale
+                # automatic-stream state or stale object facts.
+                external_stream = getattr(self, "_object_stream", None)
+                external_active = bool(
+                    external_stream is not None
+                    and external_stream.snapshot(now=now).get("active")
+                )
+                record_result = getattr(self, "_record_object_result", None)
+                if callable(record_result) and not external_active:
+                    terminal_stream = dict(context_snapshot)
+                    terminal_stream.update({
+                        "active": False,
+                        "lease_remaining_sec": 0.0,
+                    })
+                    record_result(
+                        [],
+                        source="control",
+                        status="stopped",
+                        latency_ms=0.0,
+                        stream=terminal_stream,
+                        stop_reason="human_absent",
+                    )
+
+    @staticmethod
+    def _apply_held_object_pose(
+        event: dict[str, Any],
+        status: HeldObjectPoseStatus,
+    ) -> None:
+        """Write the multimodal pose to the selected human only."""
+        active = event.get("active_target", {})
+        if not isinstance(active, dict):
+            return
+        details = status.to_dict()
+        active["held_object"] = copy.deepcopy(details)
+        target_id = str(active.get("target_id", ""))
+        track_id = int(active.get("track_id", 0) or 0)
+        if status.action and str(active.get("pose_action", "")) != "fallen_down":
+            active["pose_action"] = status.action
+            active["pose_action_label"] = status.action_label
+        for candidate in event.get("human_candidates", []):
+            if (
+                isinstance(candidate, dict)
+                and str(candidate.get("target_id", "")) == target_id
+            ):
+                candidate["held_object"] = copy.deepcopy(details)
+                if status.action and str(
+                    candidate.get("pose_action", "")
+                ) != "fallen_down":
+                    candidate["pose_action"] = status.action
+                    candidate["pose_action_label"] = status.action_label
+        for human in event.get("humans", []):
+            if (
+                isinstance(human, dict)
+                and int(human.get("track_id", -1) or -1) == track_id
+            ):
+                human["held_object"] = copy.deepcopy(details)
+                if status.action and str(
+                    human.get("pose_action", "")
+                ) != "fallen_down":
+                    human["pose_action"] = status.action
+                    human["pose_action_label"] = status.action_label
 
     def _run_object_detection(
         self,
@@ -1644,8 +2044,10 @@ class VisionInteractionNode(Node):
                 self._latest_objects_monotonic = now_monotonic
 
         if stream is None:
-            manager = getattr(self, "_object_stream", None)
-            stream = manager.snapshot() if manager is not None else {
+            snapshot = getattr(
+                self, "_effective_object_stream_snapshot", None
+            )
+            stream = snapshot() if callable(snapshot) else {
                 "active": False,
                 "session_id": "",
                 "rate_hz": 0.0,
@@ -1673,6 +2075,20 @@ class VisionInteractionNode(Node):
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False)
         self._object_pub.publish(message)
+        vision_trace(
+            "stage_complete",
+            result=status,
+            node="vision_interaction",
+            module="object_detection",
+            stage="object_inference",
+            source=source,
+            session_id=str(stream.get("session_id", "")),
+            sequence=sequence,
+            latency_ms=round(float(latency_ms), 3),
+            object_count=len(published_objects),
+            reason_code=stop_reason or ("inference_error" if error else ""),
+            error=error,
+        )
         return [copy.deepcopy(item) for item in published_objects]
 
     @staticmethod
@@ -1768,10 +2184,6 @@ class VisionInteractionNode(Node):
             )
             if hand_event and hand_event not in events:
                 events.append(hand_event)
-        for item in observation.get("tracked_objects", []):
-            object_event = object_to_vision_event(str(item.get("label", "")))
-            if object_event and object_event not in events:
-                events.append(object_event)
         return events
 
     def _process_enrollment_frame(self) -> None:
@@ -1794,6 +2206,15 @@ class VisionInteractionNode(Node):
         response.success = False
         response.result_json = ""
         response.error_message = ""
+        vision_trace(
+            "stage_start",
+            result="started",
+            node="vision_interaction",
+            module="vision_task",
+            stage="service",
+            task_id=str(request.task_id),
+            task_type=str(request.task_type),
+        )
         try:
             params = json.loads(request.params_json or "{}")
             if isinstance(params, list):
@@ -1811,6 +2232,18 @@ class VisionInteractionNode(Node):
         except Exception as exc:
             response.error_message = str(exc)
         response.latency_ms = (time.perf_counter() - started) * 1000.0
+        vision_trace(
+            "stage_complete",
+            result="success" if response.success else "failure",
+            node="vision_interaction",
+            module="vision_task",
+            stage="service",
+            task_id=str(response.task_id),
+            task_type=str(response.task_type),
+            latency_ms=round(float(response.latency_ms), 3),
+            reason_code="" if response.success else "task_failed",
+            error=str(response.error_message),
+        )
         return response
 
     def _run_task(self, task_type: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1832,7 +2265,12 @@ class VisionInteractionNode(Node):
         if task_type == "get_object_detection_state":
             return {
                 "ok": True,
+                # `stream` remains the externally owned Action/debug session.
+                # The automatic held-pose scheduler is observable separately
+                # and must never make a downstream caller think its own session
+                # is occupied.
                 "stream": self._object_stream.snapshot(),
+                "automatic_stream": self._held_object_stream.snapshot(),
             }
         if task_type == "recognize_face":
             recognizer = self._providers.get("face_recognition")

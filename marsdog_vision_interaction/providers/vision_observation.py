@@ -30,6 +30,7 @@ from marsdog_vision_interaction.providers.gesture_pose_engine import (
     pose_landmarks_from_objects,
 )
 from marsdog_vision_interaction.providers.pose_action import PoseActionClassifier
+from marsdog_vision_interaction.utils.logging_utils import vision_timing_trace
 from marsdog_vision_interaction.utils.stereo_view import select_camera_view
 
 logger = logging.getLogger(__name__)
@@ -718,6 +719,27 @@ class VisionObservationProvider(BaseProvider):
         action_result["landmarker"] = obs.get(
             "_landmarker_diagnostics", {}
         )
+        inference_sequence = self._inferred_frame_count + 1
+        gesture_track_id = active.track_id if active.track_id > 0 else 0
+        vision_timing_trace(
+            node="vision_observation",
+            module="gesture_pose",
+            stage="feature_extraction",
+            latency_ms=float(action_result.get("feature_ms", 0.0) or 0.0),
+            inference_sequence=inference_sequence,
+            track_id=gesture_track_id,
+        )
+        vision_timing_trace(
+            node="vision_observation",
+            module="gesture_pose",
+            stage="action_recognition",
+            latency_ms=float(
+                action_result.get("recognition_ms", 0.0) or 0.0
+            ),
+            inference_sequence=inference_sequence,
+            track_id=gesture_track_id,
+            primary_action=str(action_result.get("primary_action", "")),
+        )
         pose_key = str(action_result.get("pose_action", ""))
         pose_label = str(action_result.get("pose_action_label", ""))
         hand_key = str(action_result.get("hand_action", ""))
@@ -930,8 +952,18 @@ class VisionObservationProvider(BaseProvider):
         """
         h, w = frame.shape[:2]
         started_at = time.perf_counter()
+        inference_sequence = self._inferred_frame_count + 1
         timestamp_ms = self._next_landmarker_timestamp()
-        faces = self._detect_faces(frame, w, h) if (detect_faces and self.task_face_enabled) else []
+        faces = (
+            self._detect_faces(
+                frame,
+                w,
+                h,
+                inference_sequence=inference_sequence,
+            )
+            if (detect_faces and self.task_face_enabled)
+            else []
+        )
         pose_started_at = time.perf_counter()
         humans = (
             self._detect_pose_mediapipe(frame, w, h, timestamp_ms)
@@ -939,6 +971,16 @@ class VisionObservationProvider(BaseProvider):
             else []
         )
         pose_ms = (time.perf_counter() - pose_started_at) * 1000.0
+        if self.task_pose_enabled and self._pose_landmarker is not None:
+            vision_timing_trace(
+                node="vision_observation",
+                module="pose_landmarker",
+                stage="inference",
+                latency_ms=pose_ms,
+                inference_sequence=inference_sequence,
+                detection_count=len(humans),
+                model_variant=self._pose_model_variant,
+            )
         run_hands = (
             self.task_hand_enabled
             and self._hand_landmarker is not None
@@ -950,6 +992,14 @@ class VisionObservationProvider(BaseProvider):
             hand_started_at = time.perf_counter()
             hands = self._detect_hands(frame, w, h, timestamp_ms)
             hand_ms = (time.perf_counter() - hand_started_at) * 1000.0
+            vision_timing_trace(
+                node="vision_observation",
+                module="hand_landmarker",
+                stage="inference",
+                latency_ms=hand_ms,
+                inference_sequence=inference_sequence,
+                detection_count=len(hands),
+            )
             self._hand_inference_count += 1
             self._hand_landmarker_times.append(time.monotonic())
             if hands:
@@ -965,6 +1015,16 @@ class VisionObservationProvider(BaseProvider):
             self._hand_latency_ms.append(hand_ms)
             self._hand_detected.append(1.0 if hands else 0.0)
         self._pipeline_latency_ms.append(pipeline_ms)
+        vision_timing_trace(
+            node="vision_observation",
+            module="continuous_vision",
+            stage="pipeline",
+            latency_ms=pipeline_ms,
+            inference_sequence=inference_sequence,
+            face_count=len(faces),
+            human_count=len(humans),
+            hand_count=len(hands),
+        )
 
         return {
             "faces": faces,
@@ -986,20 +1046,49 @@ class VisionObservationProvider(BaseProvider):
 
     # ── YuNet face detection ───────────────────────────────────
 
-    def _detect_faces(self, frame: np.ndarray, w: int, h: int) -> list[dict[str, Any]]:
+    def _detect_faces(
+        self,
+        frame: np.ndarray,
+        w: int,
+        h: int,
+        *,
+        inference_sequence: int = 0,
+    ) -> list[dict[str, Any]]:
         if self._face_detector is None:
             return []
 
         try:
-            self._face_detector.setInputSize((w, h))
-            _, results = self._face_detector.detect(frame)
+            detect_started = time.perf_counter()
+            try:
+                self._face_detector.setInputSize((w, h))
+                _, results = self._face_detector.detect(frame)
+            except Exception:
+                vision_timing_trace(
+                    node="vision_observation",
+                    module="face_detection",
+                    stage="yunet_inference",
+                    latency_ms=(time.perf_counter() - detect_started) * 1000.0,
+                    result="failure",
+                    inference_sequence=inference_sequence,
+                    detection_count=0,
+                )
+                raise
+            vision_timing_trace(
+                node="vision_observation",
+                module="face_detection",
+                stage="yunet_inference",
+                latency_ms=(time.perf_counter() - detect_started) * 1000.0,
+                inference_sequence=inference_sequence,
+                detection_count=0 if results is None else len(results),
+            )
             faces = []
             if results is None or len(results) == 0:
                 # Feed empty detections to tracker to keep state consistent
                 if self._face_tracker is not None:
-                    self._face_tracker.update(
+                    self._update_face_tracker(
                         np.empty((0, 4), dtype=np.float32),
                         np.empty((0,), dtype=np.float32),
+                        inference_sequence=inference_sequence,
                     )
                 return []
 
@@ -1027,9 +1116,10 @@ class VisionObservationProvider(BaseProvider):
 
             if not face_data:
                 if self._face_tracker is not None:
-                    self._face_tracker.update(
+                    self._update_face_tracker(
                         np.empty((0, 4), dtype=np.float32),
                         np.empty((0,), dtype=np.float32),
+                        inference_sequence=inference_sequence,
                     )
                 return []
 
@@ -1038,7 +1128,11 @@ class VisionObservationProvider(BaseProvider):
             if self._face_tracker is not None:
                 xyxy_arr = np.array(detections_xyxy, dtype=np.float32)
                 scores_arr = np.array(detections_scores, dtype=np.float32)
-                track_ids = self._face_tracker.update(xyxy_arr, scores_arr)
+                track_ids = self._update_face_tracker(
+                    xyxy_arr,
+                    scores_arr,
+                    inference_sequence=inference_sequence,
+                )
 
             # ── Throttled SFace recognition ──
             now = time.time()
@@ -1065,7 +1159,11 @@ class VisionObservationProvider(BaseProvider):
                     if self._face_rec_throttle.should_recognize(
                         tid, fd["confidence"], bw, bh, is_active, now,
                     ):
-                        identity, identity_conf = self._run_sface(frame, fd)
+                        identity, identity_conf = self._run_sface(
+                            frame,
+                            fd,
+                            inference_sequence=inference_sequence,
+                        )
                         self._face_rec_throttle.update_identity(tid, identity, identity_conf, now)
 
                 # Read current track state
@@ -1096,8 +1194,49 @@ class VisionObservationProvider(BaseProvider):
             logger.debug("Face detection error: %s", exc)
             return []
 
+    def _update_face_tracker(
+        self,
+        xyxy: np.ndarray,
+        scores: np.ndarray,
+        *,
+        inference_sequence: int,
+    ) -> Any:
+        """Run one ByteTrack update and expose only its compute duration."""
+        started = time.perf_counter()
+        try:
+            track_ids = self._face_tracker.update(xyxy, scores)
+        except Exception:
+            vision_timing_trace(
+                node="vision_observation",
+                module="face_tracking",
+                stage="bytetrack_update",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                result="failure",
+                inference_sequence=inference_sequence,
+                detection_count=len(xyxy),
+                track_count=0,
+            )
+            raise
+        valid_track_count = sum(
+            1 for value in track_ids if int(value) >= 0
+        )
+        vision_timing_trace(
+            node="vision_observation",
+            module="face_tracking",
+            stage="bytetrack_update",
+            latency_ms=(time.perf_counter() - started) * 1000.0,
+            inference_sequence=inference_sequence,
+            detection_count=len(xyxy),
+            track_count=valid_track_count,
+        )
+        return track_ids
+
     def _run_sface(
-        self, frame: np.ndarray, face: dict[str, Any],
+        self,
+        frame: np.ndarray,
+        face: dict[str, Any],
+        *,
+        inference_sequence: int = 0,
     ) -> tuple[str, float]:
         """Run SFace recognition on a single face ROI.
 
@@ -1108,6 +1247,11 @@ class VisionObservationProvider(BaseProvider):
         if self._face_rec_throttle.enrolled_count == 0:
             return ("unknown", 0.0)
 
+        started = time.perf_counter()
+        result = "failure"
+        reason_code = "recognition_error"
+        traced_identity = "unknown"
+        traced_score = 0.0
         try:
             x1, y1 = int(face["x1"]), int(face["y1"])
             x2, y2 = int(face["x2"]), int(face["y2"])
@@ -1115,6 +1259,7 @@ class VisionObservationProvider(BaseProvider):
             x1 = max(0, x1); y1 = max(0, y1)
             x2 = min(w_img, x2); y2 = min(h_img, y2)
             if x2 <= x1 or y2 <= y1:
+                reason_code = "invalid_face_roi"
                 return ("unknown", 0.0)
 
             # alignCrop requires the original 15-value YuNet detection row.
@@ -1131,10 +1276,12 @@ class VisionObservationProvider(BaseProvider):
             if aligned is None or aligned.size == 0:
                 aligned = frame[y1:y2, x1:x2]
                 if aligned.size == 0:
+                    reason_code = "empty_face_roi"
                     return ("unknown", 0.0)
 
             feature = self._face_rec_model.feature(aligned)
             if feature is None:
+                reason_code = "feature_unavailable"
                 return ("unknown", 0.0)
 
             # Compare against enrolled embeddings
@@ -1148,13 +1295,33 @@ class VisionObservationProvider(BaseProvider):
                         best_name = name
 
             threshold = self._face_rec_throttle._cosine_threshold
+            result = "success"
             if best_score >= threshold:
+                reason_code = "matched"
+                traced_identity = best_name
+                traced_score = round(float(best_score), 4)
                 return (best_name, round(float(best_score), 4))
+            reason_code = "no_match"
+            traced_score = round(float(best_score), 4)
             return ("unknown", round(float(best_score), 4))
 
         except Exception as exc:
             logger.debug("SFace recognition error: %s", exc)
             return ("unknown", 0.0)
+        finally:
+            vision_timing_trace(
+                node="vision_observation",
+                module="face_recognition",
+                stage="sface_inference",
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+                result=result,
+                force=True,
+                inference_sequence=inference_sequence,
+                track_id=int(face.get("track_id", -1) or -1),
+                identity=traced_identity,
+                confidence=traced_score,
+                reason_code=reason_code,
+            )
 
     @staticmethod
     def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:

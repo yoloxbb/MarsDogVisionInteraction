@@ -1,7 +1,7 @@
 archive:
   name: marsdog_multi_project_contract
-  version: 1.3.4
-  baseline_date: "2026-09-02"
+  version: 1.3.6
+  baseline_date: "2026-09-03"
   json_encoding: UTF-8
 
 nodes:
@@ -92,8 +92,10 @@ topics:
       EVT_VISION_STOP_GESTURE:
         condition: fixed_face_identity_confirmed_with_stop_gesture
       EVT_VISION_FOOD:
+        condition: fixed_face_identity_confirmed_with_holding_dog_food_pose
         labels: [dog bowl, dog food can, dog treat bag]
       EVT_VISION_TOY:
+        condition: fixed_face_identity_confirmed_with_holding_toy_pose
         labels: [dog toy ball, dog frisbee toy, dog tug ring toy]
     reserved_not_emitted_events:
       - EVT_VISION_ANIMAL_CALM
@@ -254,6 +256,16 @@ invariants:
   vision_object_startup_rate_hz: 0.0
   vision_object_default_on_demand_rate_hz: 2.0
   vision_object_stream_owner: action_executor
+  vision_held_object_context_rate_hz: 2.0
+  vision_held_object_context_session: vision-human-holding
+  vision_held_object_context_policy: active_human_only_preempted_by_explicit_stream
+  vision_held_object_confirmation: two_positive_results_with_one_intermediate_miss_allowed
+  vision_held_object_max_pose_object_sync_delta_sec: 0.75
+  vision_held_object_wrist_distance_ratio: 0.16
+  vision_toy_food_event_policy: confirmed_registered_person_holding_pose_only
+  vision_stop_gesture_policy: raised_command_zone_open_palm_with_temporal_stability
+  vision_jump_policy: full_body_two_frames_or_cropped_one_strong_or_two_takeoff_frames_plus_return
+  vision_stomp_policy: ankle_lift_return_cycle_or_cropped_knee_cycle_with_stable_body
   vision_stranger_event_policy: generic_evt_vision_stranger_only
   stranger_emotion_fusion_owner: behavior_tree
   vision_does_not_subscribe_emotion_state: true

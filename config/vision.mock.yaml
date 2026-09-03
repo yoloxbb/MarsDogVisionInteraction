@@ -1,6 +1,8 @@
 logging:
   level: INFO
   dir: log
+  event_trace: true
+  timing_trace_interval_sec: 5.0
 storage:
   root: ${MARSDOG_VISION_DATA_DIR}/mock
 face_api:

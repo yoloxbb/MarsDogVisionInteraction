@@ -20,6 +20,7 @@ from marsdog_vision_interaction.providers.gesture_pose_engine import (
     HandLandmarkSet,
     LandmarkFrame,
     PoseLandmarkSet,
+    stop_command_zone_evidence,
 )
 
 
@@ -33,6 +34,7 @@ _ACTION_LABEL: dict[str, str] = {
     "nodding": "快速点头",
     "clapping": "双手鼓掌",
     "thumbs_up": "点赞手势",
+    "victory": "胜利/V字手势",
     "hands_on_hips": "双手叉腰",
     "rapid_wave_slap": "快速挥手/拍打",
     "finger_pointing": "用手指点",
@@ -71,6 +73,7 @@ _HAND_ACTIONS: dict[ActionName, str] = {
     ActionName.STOP_GESTURE: "stop_gesture",
     ActionName.CLAPPING: "clapping",
     ActionName.THUMBS_UP: "thumbs_up",
+    ActionName.VICTORY: "victory",
     ActionName.POINTING: "finger_pointing",
     ActionName.FACE_COVERING: "hands_covering_face",
     ActionName.HANDS_ON_HEAD: "hands_covering_face",
@@ -93,7 +96,13 @@ def _rounded_optional(value: float | None) -> float | None:
     return round(float(value), 4) if value is not None else None
 
 
-def _hand_feature_debug(features: Any, motion: float | None) -> dict[str, Any]:
+def _hand_feature_debug(
+    features: Any,
+    motion: float | None,
+    *,
+    command_zone_score: float,
+    wrist_height_ratio: float | None,
+) -> dict[str, Any]:
     straightness = [
         _rounded_optional(value)
         for value in features.finger_straightness_degrees
@@ -108,6 +117,8 @@ def _hand_feature_debug(features: Any, motion: float | None) -> dict[str, Any]:
         "palm_facing_score": _rounded_optional(features.palm_facing_score),
         "palm_scale": _rounded_optional(features.palm_scale),
         "motion_energy": _rounded_optional(motion),
+        "stop_command_zone_score": round(command_zone_score, 4),
+        "stop_wrist_height_ratio": _rounded_optional(wrist_height_ratio),
     }
 
 
@@ -201,6 +212,20 @@ class PoseActionClassifier:
                 )
             )
 
+        if result.jump_status.event_triggered:
+            logger.info(
+                "GesturePose jump confirmed: track_id=%s mode=%s "
+                "evidence=%.3f full_body=%.3f upper_body=%.3f "
+                "return=%.3f missing=%s",
+                track_id,
+                result.jump_status.mode,
+                result.jump_status.evidence_score,
+                result.jump_status.full_body_score,
+                result.jump_status.upper_body_score,
+                result.jump_status.return_score,
+                ",".join(result.jump_status.missing_landmarks) or "none",
+            )
+
         self._fall_event_triggered = result.fall_status.event_triggered
         # Fall alert_active is intentionally held by the reference engine so a
         # BEST_EFFORT subscriber has more than one frame in which to observe it.
@@ -219,6 +244,30 @@ class PoseActionClassifier:
                 break
 
         temporal = result.features.temporal
+        left_command_zone = stop_command_zone_evidence(
+            pose_landmarks,
+            left_hand,
+        )
+        right_command_zone = stop_command_zone_evidence(
+            pose_landmarks,
+            right_hand,
+        )
+        raw_score_map = result.raw_score_map
+        ankle_stomp_available = (
+            temporal.max_ankle_vertical_speed is not None
+            and temporal.ankle_vertical_range_ratio is not None
+        )
+        knee_stomp_available = (
+            temporal.max_knee_vertical_speed is not None
+            and temporal.knee_vertical_range_ratio is not None
+        )
+        stomp_source = (
+            "ankle"
+            if ankle_stomp_available
+            else "knee_fallback"
+            if knee_stomp_available
+            else "unavailable"
+        )
         self._diagnostics = {
             "face_observed": face_observed,
             "primary_action": (
@@ -250,14 +299,103 @@ class PoseActionClassifier:
                     result.fall_status.cooldown_remaining_s, 3
                 ),
             },
+            "jump_detector": {
+                "mode": result.jump_status.mode,
+                "phase": result.jump_status.phase,
+                "evidence_score": round(
+                    result.jump_status.evidence_score, 4
+                ),
+                "full_body_score": round(
+                    result.jump_status.full_body_score, 4
+                ),
+                "upper_body_score": round(
+                    result.jump_status.upper_body_score, 4
+                ),
+                "return_score": round(
+                    result.jump_status.return_score, 4
+                ),
+                "evidence_frames": result.jump_status.evidence_frames,
+                "event_triggered": result.jump_status.event_triggered,
+                "active": result.jump_status.active,
+                "hold_remaining_s": round(
+                    result.jump_status.hold_remaining_s, 3
+                ),
+                "cooldown_remaining_s": round(
+                    result.jump_status.cooldown_remaining_s, 3
+                ),
+                "missing_landmarks": list(
+                    result.jump_status.missing_landmarks
+                ),
+                "torso_scale_change_ratio": _rounded_optional(
+                    result.jump_status.torso_scale_change_ratio
+                ),
+                "component_scores": {
+                    "hip_upward": round(
+                        result.jump_status.hip_upward_score, 4
+                    ),
+                    "shoulder_upward": round(
+                        result.jump_status.shoulder_upward_score, 4
+                    ),
+                    "ankle_upward": round(
+                        result.jump_status.ankle_upward_score, 4
+                    ),
+                    "motion_coherence": round(
+                        result.jump_status.motion_coherence_score, 4
+                    ),
+                    "torso_stability": round(
+                        result.jump_status.torso_stability_score, 4
+                    ),
+                    "baseline_displacement": round(
+                        result.jump_status.displacement_score, 4
+                    ),
+                    "position_return": round(
+                        result.jump_status.return_position_score, 4
+                    ),
+                },
+                "baseline_ready": result.jump_status.baseline_ready,
+                "upward_displacement_ratio": _rounded_optional(
+                    result.jump_status.upward_displacement_ratio
+                ),
+                "rejection_reason": result.jump_status.rejection_reason,
+            },
+            "stomp_detector": {
+                "source": stomp_source,
+                "score": round(raw_score_map[ActionName.STOMPING], 4),
+                "recognized": any(
+                    action.name is ActionName.STOMPING
+                    for action in result.actions
+                ),
+                "ankle_vertical_speed": _rounded_optional(
+                    temporal.max_ankle_vertical_speed
+                ),
+                "ankle_vertical_range_ratio": _rounded_optional(
+                    temporal.ankle_vertical_range_ratio
+                ),
+                "ankle_direction_changes": (
+                    temporal.ankle_vertical_direction_changes
+                ),
+                "knee_vertical_speed": _rounded_optional(
+                    temporal.max_knee_vertical_speed
+                ),
+                "knee_vertical_range_ratio": _rounded_optional(
+                    temporal.knee_vertical_range_ratio
+                ),
+                "knee_direction_changes": (
+                    temporal.knee_vertical_direction_changes
+                ),
+            },
             "hand_features": {
                 "left": _hand_feature_debug(
                     result.features.left_hand,
                     temporal.left_hand_motion_energy,
+                    command_zone_score=left_command_zone[0],
+                    wrist_height_ratio=left_command_zone[1],
                 ),
                 "right": _hand_feature_debug(
                     result.features.right_hand,
                     temporal.right_hand_motion_energy,
+                    command_zone_score=right_command_zone[0],
+                    wrist_height_ratio=right_command_zone[1],
                 ),
             },
             "recognized_actions": [
@@ -287,6 +425,36 @@ class PoseActionClassifier:
                 "window_duration_s": round(temporal.window_duration_s, 3),
                 "pose_motion_energy": _rounded_optional(
                     temporal.pose_motion_energy
+                ),
+                "shoulder_vertical_velocity": _rounded_optional(
+                    temporal.shoulder_vertical_velocity
+                ),
+                "hip_vertical_velocity": _rounded_optional(
+                    temporal.hip_vertical_velocity
+                ),
+                "ankle_vertical_velocity": _rounded_optional(
+                    temporal.ankle_vertical_velocity
+                ),
+                "max_ankle_vertical_speed": _rounded_optional(
+                    temporal.max_ankle_vertical_speed
+                ),
+                "ankle_vertical_range_ratio": _rounded_optional(
+                    temporal.ankle_vertical_range_ratio
+                ),
+                "ankle_vertical_direction_changes": (
+                    temporal.ankle_vertical_direction_changes
+                ),
+                "max_knee_vertical_speed": _rounded_optional(
+                    temporal.max_knee_vertical_speed
+                ),
+                "knee_vertical_range_ratio": _rounded_optional(
+                    temporal.knee_vertical_range_ratio
+                ),
+                "knee_vertical_direction_changes": (
+                    temporal.knee_vertical_direction_changes
+                ),
+                "torso_scale_change_ratio": _rounded_optional(
+                    temporal.torso_scale_change_ratio
                 ),
                 "head_motion_energy": _rounded_optional(
                     temporal.head_motion_energy

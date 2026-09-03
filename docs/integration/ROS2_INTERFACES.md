@@ -147,10 +147,12 @@ Behavior Tree 分别消费 `/perception/visual_event` 和 `/emotion/state`，在
 
 ### 3.1 `/perception/vision/object_detections`
 
-正式配置以 `inference_rate_hz=0` 启动，不持续占用 RKNN。Action 通过
-`VisionTask.set_object_detection` 开启带 `session_id` 和租约的数据流；默认
-2 Hz、最大 5 Hz。视觉只发布检测数据，搜索、靠近、目标丢失处理和 `/cmd_vel`
-全部属于 Action。推理流与单次 Service 串行访问 RKNN，不会并发执行。
+正式配置以 `inference_rate_hz=0` 启动，不运行全天候固定物体流。人物处于
+`tracking` 时，Vision 使用可让路的 `vision-human-holding` 内部流以2 Hz判断
+`holding_toy/holding_dog_food`；无人2秒后停止。Action 通过
+`VisionTask.set_object_detection` 开启带 `session_id` 和租约的数据流；默认2 Hz、
+最大5 Hz，并始终比内部流优先。视觉不负责搜索、靠近、目标丢失运动或
+`/cmd_vel`。所有物体推理与单次Service串行访问RKNN，不会并发执行。
 
 ```json
 {
@@ -222,7 +224,7 @@ float64 latency_ms
 | `check_person` | `{}` | `ok`, `present`, `count` |
 | `detect_objects` | 可选 `confidence`, `target_labels[]` | `ok`, `objects[]`，单帧查询 |
 | `set_object_detection` | `enabled`, `session_id`; 开启时可选 `rate_hz`, `confidence`, `target_labels[]`, `lease_sec` | `ok`, `stream` |
-| `get_object_detection_state` | `{}` | `ok`, `stream` |
+| `get_object_detection_state` | `{}` | `ok`, `stream`, `automatic_stream`；前者仅为外部 Action/调试 session，后者仅为手持姿态自动流 |
 | `recognize_face` | `{}` | `ok`, `user_id`, `confidence`, `matched` |
 | `start_face_enrollment` | 固定 `name`, `required_shots`（默认 3，范围1～5） | `ok`, `step`, `total_steps`, `pose`, `prompt` |
 | `cancel_face_enrollment` | `{}` | `ok`, `cancelled` |

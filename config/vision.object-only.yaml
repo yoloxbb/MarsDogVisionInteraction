@@ -1,6 +1,8 @@
 logging:
   level: INFO
   dir: log
+  event_trace: true
+  timing_trace_interval_sec: 5.0
 
 storage:
   root: ${MARSDOG_VISION_DATA_DIR}/object-debug
@@ -40,6 +42,8 @@ providers:
       inference_rate_hz: 1.0
       on_demand_rate_hz: 2.0
       max_inference_rate_hz: 5.0
+      # No human/Pose provider exists in this dedicated object-only launch.
+      held_pose_enabled: false
       default_lease_sec: 3.0
       max_lease_sec: 30.0
       scheduler_rate_hz: 20.0

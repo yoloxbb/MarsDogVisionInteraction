@@ -1,8 +1,8 @@
 # MarsDog 视觉测试工程师验收说明
 
-> 适用基线：2026-09-02。本文以当前 `vision.yaml`、
-> `vision_debug.launch.py` 和 ROS2 契约为准，面向设备端功能验收、问题复现和
-> 测试证据交付。
+> 适用基线：2026-09-03。本文以当前 `vision.yaml`、
+> `vision_debug.launch.py` 和 [ROS2_CONTRACT.md](ROS2_CONTRACT.md) 为准，面向设备端
+> 功能验收、问题复现和测试证据交付。
 
 ## 1. 测试范围与重要边界
 
@@ -45,8 +45,17 @@ export TEST_RUN_ID="$(date +%Y%m%d-%H%M%S)-vision"
 mkdir -p "test-evidence/$TEST_RUN_ID"
 
 ros2 launch marsdog_vision_interaction vision_debug.launch.py \
-  web_host:=0.0.0.0 2>&1 | tee "test-evidence/$TEST_RUN_ID/vision-launch.log"
+  web_host:=0.0.0.0 \
+  test_run_id:="$TEST_RUN_ID" \
+  test_case_id:="SMOKE-01" \
+  log_dir:="test-evidence/$TEST_RUN_ID" 2>&1 | \
+  tee "test-evidence/$TEST_RUN_ID/vision-launch.log"
 ```
+
+`logging.event_trace=true` 时，节点同时生成
+`vision_trace_<时间>_<pid>.jsonl`。其中每行均以 `VISION_TRACE ` 开头，后接单行
+JSON；`run_id/case_id` 来自上述 launch 参数，也可分别使用环境变量
+`MARSDOG_TEST_RUN_ID/MARSDOG_TEST_CASE_ID` 注入。
 
 ## 3. 启动与基础健康检查
 
@@ -117,6 +126,9 @@ unavailable` 时，本轮真实模型测试不得判为通过。
 | GATE-01 | 姿态事件身份门控 | 同一动作由已登记人/陌生人执行 | 姿态门控、事件历史 | `Visual state changed` | 仅固定身份 + `confirmed_known` + `tracking` 上报姿态事件 |
 | POS-01 | 姿态与动作 | 按动作清单逐项表演 | GesturePose 分数、人体表 | `gesture_debug` | 原始候选可解释；仅稳定命中写兼容动作/事件 |
 | STOP-01 | 停止手势 | 正例、挥手、指点、抱臂反例 | 手部特征、黄色事件记录 | `hands[]`、`EVT_VISION_STOP_GESTURE` | 3/5 帧稳定；反例不触发；身份门控有效 |
+| JUMP-01 | 跳跃 | 全身/缺脚踝原地跳；快速起立、踮脚、走路反例 | 识别通道、起跳/回落证据、肩/髋/脚速度 | `jump_detector`、`recognized_actions` | 全身两帧共同上升；半身要求肩髋上升后回落；身份门控有效 |
+| STOMP-01 | 跺脚 | 全身/缺脚踝跺脚；抬腿保持、跳跃、走路反例 | 脚踝/膝部通道、速度、幅度、换向 | `stomp_detector`、`recognized_actions` | 完成局部抬落周期；身体中心稳定；3/5帧确认；身份门控有效 |
+| HOLD-01 | 手持玩具/狗粮 | 手持正例；地面、桌面、远离手腕反例 | 手持状态和关联证据 | `active_target.held_object`、TOY/FOOD事件 | 两个物体结果确认；只关联当前人；身份门控有效 |
 | FALL-01 | 跌倒 | 直立布防→受控快速躺倒；静态躺卧 | 跌倒状态、红色事件记录 | `Fall event confirmed`、`fall_detector` | 真转换触发一次边沿；静态躺卧不触发；30 s 冷却 |
 | STRANGER-01 | 陌生人事件边界 | 陌生人、已知人；情绪状态变化 | 视觉事件和历史 | 节点订阅、`events[]` | 陌生人始终只发 Stranger；视觉不订阅情绪；组合判断属于行为树 |
 | EVT-01 | 视觉事件流 | 人/动作进入、保持、离开 | ENTER/ACTIVE/EXIT | `vision_epoch/sequence/events[]` | Topic 约 10 Hz；生命周期正确压缩；序号递增 |
@@ -284,9 +296,228 @@ Visual state changed: track=<id> tracking=<state> identity=<name> identity_state
 | P3 积极互动 | `arms_raised`、`waving`、`victory`、`jumping`、`arms_open`、`fast_nod`、`clapping`、`thumbs_up` | `EVT_VISION_MASTER_HAPPY` |
 | P4 普通状态 | `standing`、`sitting`、`lying`、`low_motion` | 兼容普通状态；稳定站/坐/低运动映射 Neutral，静态 lying 不是跌倒 |
 
-每个动作至少保存：站位录像、`primary_action/primary_priority`、对应
-`raw_scores[]` 条目、`recognized_actions[]` 条目、`support_ratio/duration_s`、兼容
-动作、最终 `events[]`。正例和最相似反例各做至少 3 次。
+#### 5.6.1 一次动作必须按五层结果对齐
+
+视觉不像语音指令那样“一条输入对应一个独立事件”。测试人员必须从精确识别结果
+逐层检查到正式事件，不能只看到 Happy/Sad 就判定具体动作正确：
+
+| 层级 | 字段 | 含义 | 能证明什么 |
+|---|---|---|---|
+| 1. 原始候选 | `raw_scores[name=<精确名>].score` | 当前帧规则分数，尚未经过时序确认 | 只能定位规则是否接近成立，不能判成功 |
+| 2. 稳定识别 | `recognized_actions[name=<精确名>]` | 经过动作自己的窗口、支持率和滞回后成立 | 证明 GesturePose 确实识别了该精确动作 |
+| 3. 主动作 | `primary_action/primary_priority` | 同帧多个稳定动作中按 P0～P4 选出的最高优先动作 | 证明本帧展示主结果；不能替代完整 `recognized_actions[]` |
+| 4. 兼容输出 | `legacy_pose_action/legacy_hand_actions[]`；正式包中的 `active_target.pose_action/hands[].hand_action` | 折叠给既有下游的公开动作名称 | 证明精确动作已正确折叠；多个精确动作可能共用同一个值 |
+| 5. 正式事件 | `/perception/visual_event.events[]` 和 `VISION_TRACE event_publish` | 身份门禁后的正式 Vision 事件 | 证明 Vision 已发布；不能证明 Tree 已选择或 Action 已执行 |
+
+一条正例只有第2～5层都符合下表预期，才能判“识别与 Vision 路由 PASS”。若第2层
+成功，但人物不是固定人脸库中的 `confirmed_known + tracking`，应看到
+`event_suppressed`，该用例只能判“动作识别 PASS、身份门禁 PASS”，不能要求正式姿态
+事件。`raw_scores` 单帧升高但始终没有进入 `recognized_actions[]`，动作识别仍是 FAIL。
+
+#### 5.6.2 25 个精确动作逐项测试对齐表
+
+“表演要点”用于统一测试人员动作，不代替算法完整公式。动态动作应完整做完一个周期；
+静态动作应保持到 `recognized_actions[]` 稳定出现。所有正式姿态事件都默认要求
+`identity ∈ {owner,family_member_1..4}`、`identity_state=confirmed_known`、
+`tracking_state=tracking`。
+
+| 用例 ID | 中文动作与表演要点 | 精确名称（优先级/组） | 预期兼容字段 | 身份门禁打开时的正式事件 |
+|---|---|---|---|---|
+| GP-001 | 受控跌倒：先直立完成布防，再快速转倒并持续躺卧 | `fall`（P0/event） | `pose_action=fallen_down` | `EVT_VISION_FALL` |
+| GP-002 | 停止：举起单掌，四根非拇指伸直、掌心朝镜头并保持稳定 | `stop_gesture`（P0/event） | `hand_action=stop_gesture` | `EVT_VISION_STOP_GESTURE` |
+| GP-003 | 双手叉腰：双手落在腰/髋部附近，双肘向两侧展开 | `hands_on_hips`（P1/gesture） | `pose_action=hands_on_hips` | `EVT_VISION_MASTER_SAD` |
+| GP-004 | 大幅挥臂/拍打：手臂做明显、连续的大范围摆动 | `large_arm_swing`（P1/dynamic） | `pose_action=rapid_wave_slap` | `EVT_VISION_MASTER_SAD` |
+| GP-005 | 指点：一只手伸出食指形成明确指向，其余手指收拢 | `pointing`（P1/gesture） | `hand_action=finger_pointing` | `EVT_VISION_MASTER_SAD` |
+| GP-006 | 急促跺脚：一侧脚或膝完成可见的抬起—落下周期，身体中心基本稳定 | `stomping`（P1/dynamic） | `pose_action=stomping` | `EVT_VISION_MASTER_SAD` |
+| GP-007 | 抱臂：两条前臂交叉于胸前并保持 | `arms_crossed`（P1/gesture） | `pose_action=arms_crossed` | `EVT_VISION_MASTER_SAD` |
+| GP-008 | 低头：头部相对肩线明显下垂并保持 | `head_down`（P2/posture） | `pose_action=head_down_slumped` | `EVT_VISION_MASTER_SAD` |
+| GP-009 | 垂肩：低头并让肩部呈明显塌陷/消沉姿态 | `shoulders_slumped`（P2/posture） | `pose_action=head_down_slumped` | `EVT_VISION_MASTER_SAD` |
+| GP-010 | 掩面：双手同时靠近并遮住脸部 | `face_covering`（P2/gesture） | `hand_action=hands_covering_face` | `EVT_VISION_MASTER_SAD` |
+| GP-011 | 抱头：双手同时放到头顶或头部两侧 | `hands_on_head`（P2/gesture） | `hand_action=hands_covering_face` | `EVT_VISION_MASTER_SAD` |
+| GP-012 | 蜷缩：下蹲/收拢身体，使头、躯干和四肢呈明显蜷缩 | `curled_up`（P2/posture） | `pose_action=body_curled_up` | `EVT_VISION_MASTER_SAD` |
+| GP-013 | 驼背：躯干明显向前弓曲并保持 | `hunched`（P2/posture） | `pose_action=hunched_back` | `EVT_VISION_MASTER_SAD` |
+| GP-014 | 举手：至少一侧手腕高于肩部并保持 | `arms_raised`（P3/gesture） | `pose_action=arm_raise_wave` | `EVT_VISION_MASTER_HAPPY` |
+| GP-015 | 挥手：手臂举起后做连续往返挥动 | `waving`（P3/dynamic） | `pose_action=arm_raise_wave` | `EVT_VISION_MASTER_HAPPY` |
+| GP-016 | V 字手势：同一只手伸出食指和中指形成 V 字 | `victory`（P3/gesture） | `hand_action=victory` | `EVT_VISION_MASTER_HAPPY` |
+| GP-017 | 跳跃：全身起跳；脚踝裁切时做肩髋整体抬升并正常回落 | `jumping`（P3/dynamic） | `pose_action=jump` | `EVT_VISION_MASTER_HAPPY` |
+| GP-018 | 张开双臂：双臂向两侧明显展开，可伴轻微前倾并保持 | `arms_open`（P3/gesture） | `pose_action=lean_forward_arms_open` | `EVT_VISION_MASTER_HAPPY` |
+| GP-019 | 快速点头：脸部可见，头部完成连续快速上下往返 | `fast_nod`（P3/dynamic） | `pose_action=nodding` | `EVT_VISION_MASTER_HAPPY` |
+| GP-020 | 鼓掌：双掌在胸前重复靠近—接触—分开 | `clapping`（P3/dynamic） | `hand_action=clapping` | `EVT_VISION_MASTER_HAPPY` |
+| GP-021 | 点赞：一只手拇指伸出，其余手指收拢并保持 | `thumbs_up`（P3/gesture） | `hand_action=thumbs_up` | `EVT_VISION_MASTER_HAPPY` |
+| GP-022 | 站立：躯干直立，腿部呈站姿并稳定保持 | `standing`（P4/posture） | `pose_action=neutral_stand_sit` | `EVT_VISION_MASTER_NEUTRAL` |
+| GP-023 | 坐姿：躯干直立、髋膝弯曲形成明确坐姿并保持 | `sitting`（P4/posture） | `pose_action=neutral_stand_sit` | `EVT_VISION_MASTER_NEUTRAL` |
+| GP-024 | 静态躺卧：测试人员已经躺好后进入画面或保持静止 | `lying`（P4/posture）；同时 `pose_state=lying` | 无精确动作兼容输出 | 无；静态躺卧不得产生 `EVT_VISION_FALL` |
+| GP-025 | 低运动：自然站立或坐下并长时间基本不动 | `low_motion`（P4/activity） | `pose_action=neutral_stand_sit` | `EVT_VISION_MASTER_NEUTRAL` |
+
+其中 P0 优先级最高，P4 最低；这是识别器在同一帧选择主动作的优先级，不是 ROS QoS，
+也不是行为树候选优先级。一个帧中可以同时存在一个 `pose_action` 和一个
+`hand_action`，所以例如站立时做 Stop，正式消息可以同时保留粗姿态和 Stop 手势。
+
+#### 5.6.3 多模态手持姿态对齐表
+
+下面两项不属于25个 GesturePose 原始标签，而是 Pose/Hand 与物体结果关联后产生：
+
+| 用例 ID | 测试输入 | 诊断名称与确认条件 | 预期兼容字段 | 身份门禁打开时的正式事件 |
+|---|---|---|---|---|
+| MM-001 | 手持支持的玩具并让物体靠近有效手腕 | `candidate_action=holding_toy`；两个阳性物体结果后 `action=holding_toy` | `pose_action=holding_toy`、标签“手持玩具” | `EVT_VISION_TOY` |
+| MM-002 | 手持狗碗、狗粮罐或狗粮袋并靠近有效手腕 | `candidate_action=holding_dog_food`；两个阳性物体结果后 `action=holding_dog_food` | `pose_action=holding_dog_food`、标签“手持狗粮” | `EVT_VISION_FOOD` |
+
+只在画面、地面或桌面上检测到对应物体不算手持姿态，也不能下发 TOY/FOOD。详细的
+同步时间、腕部距离、两次证据和反例要求见5.10节。
+
+#### 5.6.4 名称折叠与事件共用关系
+
+以下名称会在正式接口中合并。测试精确动作时必须以 `recognized_actions[]` 为准，
+不能倒推：
+
+| 精确识别名称 | 合并后的正式兼容值 | 共用事件 | 测试注意事项 |
+|---|---|---|---|
+| `arms_raised`、`waving` | `pose_action=arm_raise_wave` | `EVT_VISION_MASTER_HAPPY` | 事件和兼容值都不能区分“静态举手”还是“动态挥手” |
+| `head_down`、`shoulders_slumped` | `pose_action=head_down_slumped` | `EVT_VISION_MASTER_SAD` | 必须回看精确名称判断识别的是低头还是垂肩 |
+| `face_covering`、`hands_on_head` | `hand_action=hands_covering_face` | `EVT_VISION_MASTER_SAD` | 正式字段不能区分掩面与抱头 |
+| `standing`、`sitting`、`low_motion` | `pose_action=neutral_stand_sit` | `EVT_VISION_MASTER_NEUTRAL` | 站/坐看 `pose_state` 和精确名称；低运动看精确名称 |
+| P1/P2 的多个负向动作 | 各自兼容值 | `EVT_VISION_MASTER_SAD` | Sad 只证明负向类别，不证明具体动作 |
+| P3 的多个积极动作 | 各自兼容值 | `EVT_VISION_MASTER_HAPPY` | Happy 只证明积极类别，不证明具体动作 |
+
+静态 `lying` 是明确的“仅调试/状态输出”能力：识别到它但没有兼容动作和动作事件是
+当前正确行为，不得登记为“事件漏发”。`victory` 已正式折叠为 `hand_action=victory`，
+并路由到 `EVT_VISION_MASTER_HAPPY`。`lying != fall`；只有完成跌倒状态机
+的直立布防、快速转换和持续躺卧，才会得到 `fallen_down/EVT_VISION_FALL`。
+
+#### 5.6.5 同一动作在不同身份下的期望事件组
+
+事件生成顺序固定为“人脸事件 → 主目标姿态事件 → 手势事件”，数组内同名去重。
+以跳跃为例：
+
+| 场景 | GesturePose/兼容结果 | 正式 `events[]` 典型结果 | 判定 |
+|---|---|---|---|
+| 主人已确认并在跟踪 | `recognized_actions=jumping`、`pose_action=jump` | `EVT_VISION_MASTER`，随后 `EVT_VISION_MASTER_HAPPY` | 动作识别、折叠和事件路由均可 PASS |
+| 第一次匹配，仅 `candidate_known` | 同上 | 可有人脸事件，但不得有 `EVT_VISION_MASTER_HAPPY` | 动作识别 PASS；门禁阻止姿态事件 PASS |
+| 陌生人/unknown | 同上 | `EVT_VISION_STRANGER`；不得有 Happy | 动作识别 PASS；门禁 PASS |
+| 没有检测到人脸 | 可保留 GesturePose 诊断 | 通常没有 Master/Stranger，也不得有 Happy | 只判识别层和门禁层 |
+| 已知身份但 `temporarily_lost` | 可保留旧诊断 | 不得发布新的姿态事件 | 门禁 PASS |
+
+其他动作把 Happy 换成上表对应的 Sad/Neutral/Fall/Stop/TOY/FOOD 即可。注意
+`EVT_VISION_MASTER` 只表示当前主目标身份非 `unknown` 且存在人脸观察，不等于身份已
+达到 `confirmed_known`；姿态事件仍必须单独检查 `pose_event_gate=open`。
+
+#### 5.6.6 动作专项判定与统计口径
+
+建议每个动作正例执行10次，并执行最相似反例至少10次。项目若另有正式准确率门槛，
+以测试计划为准；没有冻结门槛时必须报告原始次数，不能用“偶尔成功”代替结论：
+
+```text
+精确动作识别召回率 = recognized_actions 精确名称正确次数 / 正例执行次数
+兼容字段正确率 = 兼容字段和值正确次数 / 精确动作识别成功次数
+Vision 事件路由正确率 = 门禁打开且期望事件正确次数 / 门禁打开的识别成功次数
+反例误触发率 = 反例中出现该精确名称的次数 / 反例执行次数
+```
+
+每一次动作至少保存：动作起止时间和录像时间码、`primary_action/primary_priority`、
+对应 `raw_scores[]` 条目、`recognized_actions[]` 条目、`support_ratio/duration_s`、兼容
+动作、`pose_event_gate`、最终 `events[]` 和同一时段的 `VISION_TRACE`。测试表建议直接
+使用以下列：
+
+| Case ID | 身份/门禁 | 表演动作 | 期望精确名 | 实际精确名 | 期望兼容字段 | 实际兼容字段 | 期望事件 | 实际事件 | 识别结论 | 路由结论 | 证据路径 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `GP-017-r01` | `owner/confirmed_known/tracking/open` | 原地小跳 | `jumping` |  | `pose_action=jump` |  | `EVT_VISION_MASTER_HAPPY` |  |  |  |  |
+| `GP-024-r01` | `owner/confirmed_known/tracking/open` | 已躺好后保持 | `lying` |  | `pose_state=lying`，无动作兼容值 |  | 无 Fall |  |  |  |  |
+
+#### 5.6.7 当前正式事件库存
+
+当前代码实际可能写入 `/perception/visual_event.events[]` 的事件只有下表9种：
+
+| 正式事件 | 来源 | 是否需要姿态身份门禁 | 同包主要证据 |
+|---|---|---:|---|
+| `EVT_VISION_MASTER` | 当前有 `faces[]`，且主目标 `identity` 非空、非 `unknown` | 否；它本身也不证明 `confirmed_known` | `faces[]`、`active_target.identity/identity_state` |
+| `EVT_VISION_STRANGER` | 当前有 `faces[]`，且主目标身份未知 | 否 | `faces[]`、`active_target.identity_state` |
+| `EVT_VISION_MASTER_HAPPY` | GP-014～GP-021 的兼容动作 | 是 | `recognized_actions[]`、`pose_action` 或 `hands[].hand_action` |
+| `EVT_VISION_MASTER_SAD` | GP-003～GP-013 的兼容动作 | 是 | 同上 |
+| `EVT_VISION_MASTER_NEUTRAL` | GP-022、GP-023、GP-025 折叠出的 `neutral_stand_sit` | 是 | `pose_state`、`recognized_actions[]`、`pose_action` |
+| `EVT_VISION_FALL` | GP-001 跌倒状态机确认 | 是 | `fall_detector`、`pose_action=fallen_down` |
+| `EVT_VISION_STOP_GESTURE` | GP-002 Stop 时序确认 | 是 | 手部特征、`hands[].hand_action=stop_gesture` |
+| `EVT_VISION_TOY` | MM-001 手持玩具确认 | 是 | `active_target.held_object`、`pose_action=holding_toy` |
+| `EVT_VISION_FOOD` | MM-002 手持狗粮确认 | 是 | `active_target.held_object`、`pose_action=holding_dog_food` |
+
+`EVT_VISION_ANIMAL_CALM/GREET/PLAY/BOUNDARY` 虽然已声明常量，但当前没有生成路径，
+属于预留事件。测试中没有看到它们是正确现状；若意外出现反而应登记缺陷。
+
+上述“下发”只表示 Vision 已把字符串写入正式 Topic。状态保持期间，同一个事件可能随
+约10 Hz状态流重复出现；Viewer 的 `ENTER/ACTIVE/EXIT` 是对状态流的页面压缩记录。
+需要验证行为树和动作执行时，必须继续关联 Tree 的候选注入/选择日志以及 Action 的
+goal/result，不能用 Vision `event_publish` 代替端到端成功。
+
+#### 5.6.8 单次动作的最小证据链示例
+
+已确认主人完成一次跳跃时，至少应保存同一人物、相邻时间段的以下证据：
+
+```text
+/perception/vision/gesture_debug
+  track_id=46
+  recognized_actions[].name=jumping
+  primary_action=jumping
+  legacy_pose_action=jump
+
+/perception/visual_event
+  active_target.track_id=46
+  active_target.identity=owner
+  active_target.identity_state=confirmed_known
+  active_target.tracking_state=tracking
+  active_target.pose_action=jump
+  events[]=EVT_VISION_MASTER_HAPPY
+
+VISION_TRACE
+  record=event_publish
+  event_type=EVT_VISION_MASTER_HAPPY
+  track_id=46
+  identity_state=confirmed_known
+  pose_action=jump
+  pose_event_gate=open
+```
+
+陌生人完成同样跳跃时，前两行 GesturePose 识别证据仍可成立，但正式证据应改为：
+
+```text
+/perception/visual_event events[]=EVT_VISION_STRANGER
+VISION_TRACE record=event_suppressed reason_code=identity_not_confirmed
+  pose_action=jump pose_event_gate=blocked
+```
+
+如果只保存到 `raw_scores[name=jumping]`，缺少 `recognized_actions`，不能证明识别完成；
+如果只保存到 `EVT_VISION_MASTER_HAPPY`，则无法区分它来自跳跃、举手、挥手、V字、
+鼓掌、点赞或其他积极动作，也不能证明测试的精确动作正确。
+
+推荐直接用 rosbag 同时保存精确动作和正式事件。开始录制后执行一次动作，完成后按
+`Ctrl-C` 停止：
+
+```bash
+ros2 bag record \
+  -o "test-evidence/$TEST_RUN_ID/GP-017-r01" \
+  /perception/vision/gesture_debug \
+  /perception/visual_event
+```
+
+不录 bag 时，至少在两个终端分别保存一段连续 Topic 原文，不能只取动作前或动作后的
+单帧：
+
+```bash
+timeout 15s ros2 topic echo /perception/vision/gesture_debug \
+  > "test-evidence/$TEST_RUN_ID/GP-017-r01-gesture.yaml"
+
+timeout 15s ros2 topic echo /perception/visual_event \
+  > "test-evidence/$TEST_RUN_ID/GP-017-r01-visual.yaml"
+```
+
+同一用例的结构化日志使用 `case_id` 提取：
+
+```bash
+rg '"case_id":"GP-017-r01"' \
+  "test-evidence/$TEST_RUN_ID"/vision_trace_*.jsonl \
+  > "test-evidence/$TEST_RUN_ID/GP-017-r01-trace.jsonl"
+```
+
+上述三个文件分别证明精确识别、正式发布和门禁/事件边沿，缺一项时应在报告中明确
+标为“未取证”，不能从另外一项推断。
 
 ### 5.7 Stop 手势
 
@@ -298,15 +529,145 @@ Visual state changed: track=<id> tracking=<state> identity=<name> identity_state
 | `hand_features.left/right.four_fingers_extended` | 正例应达到 `4` |
 | `palm_facing_score` | 正例明显升高，结合页面原始分判断 |
 | `motion_energy` | 保持动作时应下降，避免把挥手当 Stop |
+| `stop_wrist_height_ratio` | 以髋线为0、肩线为1；自然下垂通常不大于0，举掌应进入正值指令区 |
+| `stop_command_zone_score` | Stop 高度门控分；低于0.35时直接拒绝 |
 | `raw_scores[name=stop_gesture].score` | 达到规则阈值后成为候选；当前阈值 0.65 |
 | `recognized_actions[name=stop_gesture]` | 5 帧窗口中至少 3 帧支持后出现 |
 | `hands[].hand_action` | 稳定后为 `stop_gesture` |
 | `events[]` | 仅已确认固定身份出现 `EVT_VISION_STOP_GESTURE` |
 
-反例必须包括：快速挥手、只伸食指、握拳、侧掌、抱臂。抱臂分数明显成立时 Stop
-候选应被冲突规则清除。事件历史中 Stop 用黄色边线显示。
+反例必须包括：双手自然下垂、手贴大腿、快速挥手、只伸食指、握拳、侧掌、抱臂。
+自然下垂时即使手臂笔直、四指伸开，也必须因 `stop_command_zone_score<0.35` 被拒绝；
+抱臂分数明显成立时 Stop 候选应被冲突规则清除。事件历史中 Stop 用黄色边线显示。
 
-### 5.8 跌倒
+### 5.8 跳跃
+
+跳跃不直接依赖普通动作的单帧分数，而是使用两条互斥通道：
+
+1. `full_body`：髋部和双脚踝共同向上，0.35秒内两个证据帧直接确认。
+2. `upper_body_fallback`：仅在脚踝无法测量、但肩部和髋部有效时启用。先要求
+   约0.2秒稳定基线，再要求肩髋同步快速上升、躯干尺度变化不大，并累计相对基线的
+   整体抬升量。为适配约5 FPS的现场推理频率，一个强起跳帧或0.35秒内两个普通
+   起跳帧即可进入回落等待，最后必须在1.1秒内观察到肩髋同步回落或回到基线才确认。
+
+脚踝可见但保持原位时，不会改走半身通道，因此普通蹲起/起身仍被拒绝。两条通道确认后
+都把结果保持约0.65秒，供3/5帧稳定器输出 `jumping`。
+
+| 字段 | 预期 |
+|---|---|
+| `jump_detector.mode` | `full_body`、`upper_body_fallback` 或 `unavailable` |
+| `jump_detector.phase` | `monitoring/takeoff_candidate/awaiting_return/active/cooldown` |
+| `jump_detector.missing_landmarks` | 列出当前缺失的肩、髋或脚踝关键点 |
+| `temporal_features.shoulder_vertical_velocity` | 半身起跳向上时为明显负值 |
+| `temporal_features.hip_vertical_velocity` | 起跳向上时为明显负值 |
+| `temporal_features.ankle_vertical_velocity` | 双脚离地向上时同样为明显负值 |
+| `temporal_features.torso_scale_change_ratio` | 半身通道要求躯干形状基本稳定，避免弯腰/起身误触发 |
+| `jump_detector.full_body_score` | 髋部与脚踝共同上升分，达到0.55才累计 |
+| `jump_detector.upper_body_score` | 缺脚踝时的肩髋同步上升分；0.35累计普通帧，0.55可作为单个强起跳帧 |
+| `jump_detector.return_score` | 半身通道回落分，当前阈值0.25 |
+| `jump_detector.baseline_ready` | 半身稳定基线是否就绪；未就绪时先静止约0.2秒 |
+| `jump_detector.upward_displacement_ratio` | 肩髋中心相对稳定基线的上移量，以躯干尺度归一化 |
+| `jump_detector.component_scores` | 肩、髋、脚踝上升、肩髋同步、躯干稳定、基线抬升及位置回落分；最小项可定位当前瓶颈 |
+| `jump_detector.evidence_score` | 当前可用通道的起跳证据分 |
+| `jump_detector.evidence_frames` | 起跳阳性帧数；半身一个强帧或两个普通帧后进入 `awaiting_return` |
+| `jump_detector.rejection_reason` | 基线不足、运动不足、等待回落或未观察到回落等原因 |
+| `jump_detector.event_triggered` | 每次确认只在一帧为 `true` |
+| `jump_detector.active/hold_remaining_s` | 确认后约0.65秒保持，保证页面和状态流可观察 |
+| `recognized_actions[name=jumping]` | 保持期间经过稳定器后出现 |
+| `active_target.pose_action` | 已稳定后为 `jump` |
+| `events[]` | 仅已确认固定身份映射为 `EVT_VISION_MASTER_HAPPY` |
+
+正例至少做全身原地小跳、全身正常原地跳、脚踝被画面裁掉时的原地跳各3次；反例至少
+做快速起立、踮脚、走路、上下蹲各3次。半身正例应看到 `mode=upper_body_fallback`，
+`phase` 依次进入 `takeoff_candidate`、`awaiting_return`和`active`。若证据确认但
+没有正式事件，再检查 `recognized_actions` 和身份门控。
+节点日志中的 `GesturePose jump confirmed` 应包含对应 `track_id`、`mode`、确认时的
+全身/半身/回落证据及缺失关键点；它证明识别器完成确认，不代表身份门控后的正式
+事件一定已经发布。
+
+### 5.9 跺脚
+
+跺脚使用腿部关键点相对髋部的局部运动，不使用整个人在画面中的绝对位移：
+
+1. `ankle`：脚踝有效时，要求脚踝相对同侧髋部出现足够的垂直速度、幅度以及至少
+   一次方向反转，证明完成“抬起—落下”周期。
+2. `knee_fallback`：脚踝因近距离构图被裁掉时，改用膝部相对同侧髋部的相同周期；
+   膝部也不可用时不识别。
+
+两条通道都要求肩部/髋部整体垂直速度较低、人物保持直立，并排除过大的全身运动。
+这会阻止跳跃的整个人共同上下移动直接形成跺脚证据。完成周期后采用3/5帧确认，
+适配约5 FPS的现场推理频率。
+
+| 字段 | 预期 |
+|---|---|
+| `stomp_detector.source` | 脚踝有效时为 `ankle`；脚踝裁切且膝部有效时为 `knee_fallback` |
+| `stomp_detector.score` | 原始跺脚分，达到0.55后进入3/5帧确认 |
+| `stomp_detector.recognized` | 时序确认后为 `true` |
+| `ankle/knee_vertical_speed` | 对应关键点相对髋部的近期最大垂直速度 |
+| `ankle/knee_vertical_range_ratio` | 抬落幅度，以躯干尺度归一化 |
+| `ankle/knee_direction_changes` | 完整抬落至少为1；只抬腿不落下应为0 |
+| `recognized_actions[name=stomping]` | 完成抬落并通过3/5帧后出现 |
+| `active_target.pose_action` | 已稳定后为 `stomping` |
+| `events[]` | 仅已确认固定身份映射为 `EVT_VISION_MASTER_SAD` |
+
+正例分别做脚踝完整可见和脚踝被裁切的原地单脚跺脚各10次。反例至少包括抬腿保持、
+原地小跳、快速蹲起和正常走路；反例不应出现 `recognized_actions=stomping`。
+
+### 5.10 手持玩具/狗粮特定姿态
+
+支持的玩具标签为 `dog toy ball/dog frisbee toy/dog tug ring toy`，狗粮标签为
+`dog bowl/dog food can/dog treat bag`。检测到人物后，内部
+`vision-human-holding` 流自动以2 Hz运行；显式 Action 或页面持续识别会话优先，
+不会和内部流并发抢占RKNN。
+
+判定必须同时满足：物体置信度至少0.35；物体框接近当前人物框内的有效
+Pose/Hand 手腕；Pose与物体源帧时间差不超过0.75秒；1.5秒内两个不同物体推理
+结果均成立。允许两个阳性结果之间出现一次短暂漏检，但漏检不计证据，超过确认窗口
+仍会失效。确认后短暂保持1.25秒，跌倒姿态不被覆盖。物体可随伸出的手部分超出
+人物框，单独位于人物附近但远离手腕的物体仍不得触发。
+
+| 字段/日志 | 含义与通过标准 |
+|---|---|
+| `active_target.pose_action` | 确认后为 `holding_toy` 或 `holding_dog_food` |
+| `active_target.pose_action_label` | `手持玩具` 或 `手持狗粮` |
+| `held_object.state` | `inactive/candidate/confirmed` |
+| `held_object.object_label/object_track_id` | 实际关联的模型标签和稳定物体ID |
+| `held_object.hand_source` | 关联的 Pose 手腕或 HandLandmarker 手腕 |
+| `held_object.association_score` | 手腕接近度与物体置信度组成的诊断分 |
+| `held_object.wrist_distance_ratio` | 手腕到物体框距离除以人体框对角线 |
+| `held_object.evidence_hits/required_hits` | 第一帧为 `1/2`，第二个不同物体结果后确认 |
+| `held_object.object_result_sequence` | 实际参与本次手持判断的物体推理结果序号 |
+| `held_object.rejection_reason` | 最近一次判断未成立的明确原因；成功关联时为空 |
+| `pose_object_sync_delta_ms` | 两条异步流水线的源帧时间差；当前上限750 ms |
+| `evaluated_wrist_distance_ratio/wrist_distance_threshold_ratio` | 最近物体到最近有效手腕的归一化距离及阈值 |
+| `Visual state changed ... held=...` | 应依次记录 candidate、confirmed及释放状态 |
+
+板端复测时可直接提取每个实际物体推理结果的手持判断：
+
+```bash
+rg '"record":"held_object_evaluation"' /tmp/marsdog_vision_qa/HOLD-01/*.jsonl
+```
+
+`reason_code=""` 表示本次关联成立，并应看到 `evidence_hits` 从1到2。
+`timestamp_mismatch` 重点看 `pose_object_sync_delta_ms`；`wrist_too_far` 比较
+`wrist_distance_ratio` 与 `wrist_distance_threshold_ratio`；`no_valid_wrist` 则检查人物是否
+完整入镜及手腕关键点是否有效。`stale_object_sequence` 表示展示的是
+以前物体结果中保持的轨迹，不能作为当前证据；若每个新结果都出现该原因，
+应检查 `tracked_objects[].source_sequence` 是否与 `object_result_sequence` 一致。
+
+测试用例：
+
+1. 已登记人员分别手持三种玩具、狗粮罐、狗粮袋和狗碗，每种保持至少2秒。
+2. 将相同物体放在地上、桌面或人物框内但远离双手，均不得出现手持姿态。
+3. 只让物体靠近手腕不到一次检测周期，然后移开，不得达到 `confirmed`。
+4. 两个人同时入镜，把物体放在非当前目标手中，不得关联到当前目标。
+5. 陌生人手持时可以看到结构化姿态，但 `events[]` 不得出现 TOY/FOOD。
+6. 已确认主人/家人手持时，分别出现 `EVT_VISION_TOY/EVT_VISION_FOOD`；物体单独
+   出现不得再触发这两个事件。
+7. 人物离开后内部物体流最多保持2秒；通过页面启动显式流时，应立即显示显式
+   session，停止后人物仍在则自动恢复手持判断流。
+
+### 5.11 跌倒
 
 建议步骤：
 
@@ -332,7 +693,7 @@ Visual state changed: track=<id> tracking=<state> identity=<name> identity_state
 测试事件次数应数 `Fall event confirmed` 或页面 `ENTER`。陌生人即使状态机确认跌倒，
 也只保留调试诊断，不得发布正式跌倒事件。
 
-### 5.9 陌生人事件与下游融合边界
+### 5.12 陌生人事件与下游融合边界
 
 视觉只负责判断人脸是否属于固定人脸库。陌生人出现时，无论机器人当前情绪如何，
 视觉端都只发布 `EVT_VISION_STRANGER`；`vision_interaction` 不订阅
@@ -358,7 +719,7 @@ Topic 订阅。若测试产品最终的 Alert/Friend 行为，必须在行为树
 的 `EVT_VISION_STRANGER`、`/emotion/state`、候选仲裁日志和 Action Result；该结果
 不能记为 Vision 单模块通过证据。
 
-### 5.10 视觉事件历史与发布频率
+### 5.13 视觉事件历史与发布频率
 
 ```bash
 ros2 topic hz /perception/visual_event
@@ -392,10 +753,11 @@ Vision events[] -> Viewer ENTER/ACTIVE/EXIT
 若测试目标是完整执行链，必须再把行为树候选/仲裁日志和 Action Result 按时间关联，
 不能用 Viewer 记录代替。
 
-### 5.11 单次与持续物体识别
+### 5.14 单次与持续物体识别
 
-正式启动时物体推理频率为 0 Hz，只有手动按钮或任务会话才加载/运行模型。首次调用
-包含 RKNN 懒加载，允许明显慢于后续调用，必须单独记录首次和稳态耗时。
+正式启动时固定物体流为0 Hz；人物进入后，手持姿态内部流自动以2 Hz运行，人物
+离开2秒后停止。手动按钮、Action任务或内部流第一次调用都可能触发RKNN懒加载，
+必须分别记录首次和稳态耗时。
 
 单次测试：设置置信度，点击“单次物体识别”。连续测试：设置置信度和 0.1～5 Hz
 频率，点击“启动持续识别”，保持 40 s 后停止；另做关闭浏览器不点停止的测试。
@@ -406,7 +768,7 @@ Vision events[] -> Viewer ENTER/ACTIVE/EXIT
 | `source` | `service` | 推理包为 `stream`；停止包为 `control` |
 | `status` | `ok` 或 `error` | `ok/error/stopped` |
 | `stream.active` | 不因单次创建 session | 启动后 `true` |
-| `stream.session_id` | 空或现有会话状态 | 页面固定 `vision-debug-web` |
+| `stream.session_id` | 空或当前有效流 | 页面固定 `vision-debug-web`；自动手持流为 `vision-human-holding` |
 | `stream.rate_hz/confidence/target_labels` | 本次请求见 `request` | 应与页面/会话参数一致 |
 | `stream.lease_remaining_sec` | 不适用 | 页面每 10 s 续租 30 s；关页后最多 30 s 到期 |
 | `inference_latency_ms` | 单次模型耗时 | 每次持续推理耗时 |
@@ -423,7 +785,7 @@ Object detection lease expired: session=<id>
 再验证会话互斥：先用另一个 `session_id` 模拟 Action 占用，再从页面启动。页面应显示
 占用错误，不得抢占或停止别人的 session。停止/错误包必须清空旧物体缓存。
 
-### 5.12 VisionTask Service
+### 5.15 VisionTask Service
 
 通用传输字段：
 
@@ -460,7 +822,7 @@ params_json: '{}'}"
 至少验证：合法请求、非法 JSON、不支持任务名、Service 不可用、模型不可用、相机
 过期。所有失败必须 `success=false` 且有可定位原因，不能返回伪造成功数据。
 
-### 5.13 页面布局与性能面板
+### 5.16 页面布局与性能面板
 
 桌面宽度大于 1050 px 时，滚动右侧事件/诊断区，左侧实时画面应固定可见；窗口变窄
 后应恢复上下布局，不遮挡内容。验证复制、导出、清空事件历史均不影响 ROS Topic。
@@ -485,6 +847,57 @@ Lite/Full A/B 必须在相同相机、站位、光照、人物和动作下，各
 
 ## 6. 关键日志与字段速查
 
+### 6.0 `VISION_TRACE` 测试追踪
+
+测试判定优先使用机器可解析的 `VISION_TRACE`，普通控制台日志用于人工排障，ROS
+Topic/Service 原文用于证明实际接口结果。当前追踪记录包括：
+
+| `record` | 模块/阶段 | 关键字段 |
+|---|---|---|
+| `runtime_start` | 节点启动 | `result,node,vision_epoch,camera_topic,visual_topic,service,timing_trace_interval_sec` |
+| `stage_start/stage_complete` | VisionTask | `task_id,task_type,result,latency_ms,error` |
+| `stage_complete` | 物体推理 | `source,session_id,sequence,latency_ms,object_count` |
+| `stage_complete` | `continuous_vision/pipeline` | `inference_sequence,latency_ms,face_count,human_count,hand_count` |
+| `stage_complete` | `face_detection/yunet_inference` | `inference_sequence,latency_ms,detection_count` |
+| `stage_complete` | `face_tracking/bytetrack_update` | `inference_sequence,latency_ms,detection_count,track_count` |
+| `stage_complete` | `face_recognition/sface_inference` | `inference_sequence,track_id,latency_ms,identity,confidence,reason_code` |
+| `stage_complete` | `face_recognition/sface_task_recognize` | `latency_ms,identity,confidence,reason_code,template_identity_count` |
+| `stage_complete` | `pose_landmarker/inference` | `inference_sequence,latency_ms,detection_count,model_variant` |
+| `stage_complete` | `hand_landmarker/inference` | `inference_sequence,latency_ms,detection_count` |
+| `stage_complete` | `gesture_pose/feature_extraction` | `inference_sequence,track_id,latency_ms` |
+| `stage_complete` | `gesture_pose/action_recognition` | `inference_sequence,track_id,latency_ms,primary_action` |
+| `stage_complete` | `depth_fusion/aligned_depth_range` | `observation_stamp,latency_ms,candidate_count,fused_count` |
+| `stage_complete` | `visual_event/event_publish` | `sequence,latency_ms,event_count,events[]` |
+| `event_publish` | 正式视觉事件首次出现 | `event_type,vision_epoch,sequence,track_id,identity_state` |
+| `event_cleared` | 正式事件退出 | 同上 |
+| `event_suppressed` | 姿态候选被身份门控 | `reason_code,pose_event_gate,identity_state,tracking_state` |
+
+提取某一轮或某一用例：
+
+```bash
+rg 'VISION_TRACE' "test-evidence/$TEST_RUN_ID" | \
+  rg '"case_id":"STOP-01-r1"'
+```
+
+`event_publish` 是相对上一视觉状态首次出现的边沿证据；不要用约 10 Hz
+`/perception/visual_event` 包数量代替物理事件次数。`latency_ms` 的语义由
+`module/stage` 限定：Service 是完整回调耗时，物体阶段是推理耗时，两者不可混算。
+
+连续视觉阶段默认按 `logging.timing_trace_interval_sec=5.0` 各自采样，记录中的
+`sampled=true` 表示采样耗时；失败记录不受限频影响。SFace 只在身份节流器实际请求
+识别时运行，因此没有人脸、未录入人脸或未到复核周期时不会产生该阶段记录。需要逐次
+性能分析时可把该配置设为 `0`，但会明显增加日志量，不建议长期运行。物体推理和
+VisionTask 是按需任务，仍然逐次记录。
+
+测试报告不得把以下数值混为同一种耗时：
+
+- `continuous_vision/pipeline`：单次连续视觉模型流水线，包含人脸、Pose 和当帧实际运行的 Hand。
+- `pose_landmarker`、`hand_landmarker`、`face_*`：各模型或子阶段自身耗时。
+- `gesture_pose/*`：关键点结果之后的特征提取和规则判断，不包含模型推理。
+- `depth_fusion`：深度匹配、取样和反投影；`depth_sync_delta_ms` 是时间戳差，不是计算耗时。
+- `visual_event/event_publish`：JSON 序列化和 ROS Publisher 调用耗时，不是相机输入到动作执行的端到端耗时。
+- `vision_task/service`：完整 Service 回调耗时，可能包含其中调用的物体推理。
+
 ### 6.1 控制台日志
 
 | 日志前缀 | 关键字段 | 用途 |
@@ -494,6 +907,7 @@ Lite/Full A/B 必须在相同相机、站位、光照、人物和动作下，各
 | `Face identity changed` | track、identity、state、confidence、attempts | 身份状态机变化证据 |
 | `Visual state changed` | track、tracking、identity、identity_state、pose、hands、pose_event_gate、events | 身份门控和最终事件证据 |
 | `Fall event confirmed` | transition、lying | 一次跌倒确认边沿 |
+| `GesturePose jump confirmed` | track、mode、全身/半身/回落证据、缺失关键点 | 一次跳跃确认边沿及所用识别通道 |
 | `Object detection stream active` | session、rate、targets | 持续物体会话启动/续租证据 |
 | `Object detection lease expired` | session | 未续租自动终止证据 |
 | `Face FastAPI ready/unavailable` | docs 地址或异常 | HTTP 管理面可用性 |
@@ -523,8 +937,11 @@ Lite/Full A/B 必须在相同相机、站位、光照、人物和动作下，各
 | 兼容输出 | `legacy_pose_action,legacy_hand_actions[]` |
 | 规则结果 | `primary_action,primary_priority,state_hint,recognized_actions[],raw_scores[]` |
 | 跌倒 | `fall_phase,fall_event_triggered,fall_alert_active,fall_detector` |
-| 手势 | `hand_features.left/right` |
-| 时序 | `temporal_features`，包括头部运动、反转、位移和双腕开合 |
+| 手势 | `hand_features.left/right`，包括 Stop 手腕高度与指令区域分 |
+| 跳跃 | `jump_detector` 的识别模式、阶段、缺失关键点、全身/半身/回落证据、确认边沿、保持、冷却和拒绝原因 |
+| 跺脚 | `stomp_detector` 的脚踝/膝部通道、原始分、识别状态、速度、幅度和换向次数 |
+| 手持姿态 | 正式视觉包 `active_target.held_object`，不属于 GesturePose 原始分数 |
+| 时序 | `temporal_features`，包括头部运动、肩/髋/脚踝垂直速度、躯干尺度变化和双腕开合 |
 | 耗时 | `feature_ms,recognition_ms,landmarker` |
 
 ## 7. 故障定位表
@@ -538,6 +955,8 @@ Lite/Full A/B 必须在相同相机、站位、光照、人物和动作下，各
 | 已知人偶尔变陌生人 | 人脸质量、尺寸、阈值或 Track 变化 | `Face identity changed` 的 confidence/attempts；保存对应帧条件 |
 | lying 不触发跌倒 | 这是预期，静态 lying 缺少转换 | 看 `armed/transition_score/event_triggered`，不要直接降阈值 |
 | Stop 被识别成挥手 | 手在移动、掌向/伸指不足或未稳定 | `four_fingers_extended/palm_facing_score/motion_energy/support_ratio` |
+| 物体有框但没有手持姿态 | 未接近手腕、源帧不同步、置信度不足或只有一次证据 | `held_object.state/hand_source/wrist_distance_ratio/evidence_hits`及物体`source_sequence/header.stamp` |
+| 地面物体误报手持 | 人物框/手腕关联过宽或关键点错误 | 保存人物框、手腕和物体框；不得先降低两帧确认规则 |
 | 物体按钮长时间等待 | 首次 RKNN 懒加载或模型失败 | 页面耗时、`Ultralytics YOLOE loaded/failed`；首次与稳态分开记录 |
 | 持续物体被拒绝 | 另一 session 已占用 | 查 `get_object_detection_state`；不得从页面抢占 |
 | 有框但 `range_valid=false` | 深度/内参/frame/同步/ROI 任一不合格 | 查三个相机 Topic 与 `depth_sync_delta_ms/range_source` |
@@ -559,7 +978,9 @@ Lite/Full A/B 必须在相同相机、站位、光照、人物和动作下，各
 | 日志结果 | 精确日志前缀和关键字段，不只写“有日志” |
 | 耗时 | Service `latency_ms`、物体 `inference_latency_ms`、事件 ENTER 时间差 |
 | 期望/实际 | 分栏填写 |
-| 结论 | PASS / FAIL / BLOCKED；BLOCKED 必须写阻塞原因 |
+| 动作识别结论 | `raw_scores → recognized_actions` 是否符合预期；PASS / FAIL / BLOCKED |
+| Vision 路由结论 | 兼容字段、身份门禁、`events[]` 是否符合预期；PASS / FAIL / BLOCKED |
+| 下游结论 | 未联调 Tree/Action 时填“未验证”；不得用 Vision 发布代替执行成功 |
 | 证据 | 日志文件、事件 JSON、截图、录像的相对路径 |
 
 最终报告建议汇总：
