@@ -1,8 +1,106 @@
 # MarsDog 视觉测试工程师验收说明
 
-> 适用基线：2026-09-03。本文以当前 `vision.yaml`、
+> 测试交付版本：`v1.0.0-alpha`；Git 分支：`test/v1.0.0-alpha`；
+> 文档基线：2026-09-04。本文以该分支的 `vision.yaml`、
 > `vision_debug.launch.py` 和 [ROS2_CONTRACT.md](ROS2_CONTRACT.md) 为准，面向设备端
 > 功能验收、问题复现和测试证据交付。
+
+## 0. 拉取、确认版本、编译与启动
+
+### 0.1 首次获取代码
+
+在设备上的 ROS2 工作区中执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+mkdir -p /home/cat/ros2_ws/src
+cd /home/cat/ros2_ws/src
+git clone --branch test/v1.0.0-alpha --single-branch \
+  https://github.com/yoloxbb/MarsDogVisionInteraction.git \
+  marsdog_vision_interaction
+cd marsdog_vision_interaction
+```
+
+如果目录已存在，不要重复 `git clone`，按下一节更新。
+
+### 0.2 已有仓库更新到测试版
+
+先检查本地改动。`git status --short` 有输出时，应先保留证据并联系
+开发人员；不要直接覆盖、丢弃或合并设备上的改动。
+
+```bash
+cd /home/cat/ros2_ws/src/marsdog_vision_interaction
+git status --short
+git fetch origin --prune
+git switch test/v1.0.0-alpha
+git pull --ff-only origin test/v1.0.0-alpha
+```
+
+首次在已有仓库中切换该分支，如果 `git switch` 提示本地分支不存在，
+执行：
+
+```bash
+git switch --track -c test/v1.0.0-alpha origin/test/v1.0.0-alpha
+```
+
+### 0.3 确认实际版本
+
+下列两个提交号必须一致，且工作区应无未说明改动。将输出记入
+本轮测试记录，不要只填写 `v1.0.0-alpha`。
+
+```bash
+git branch --show-current
+git rev-parse HEAD
+git rev-parse origin/test/v1.0.0-alpha
+git status --short
+```
+
+预期分支为 `test/v1.0.0-alpha`。`v1.0.0-alpha` 是本次测试交付版本；
+问题单仍必须同时附上 `git rev-parse HEAD` 的完整提交号，以区分同一
+alpha 分支上的后续更新。
+
+### 0.4 安装依赖并编译
+
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/cat/ros2_ws/src/marsdog_vision_interaction
+uv sync --extra models --extra dev
+
+cd /home/cat/ros2_ws
+colcon build --symlink-install \
+  --packages-select marsdog_vision_interaction \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+source /home/cat/ros2_ws/install/setup.bash
+ros2 pkg prefix --share marsdog_vision_interaction
+```
+
+最后一条命令应指向 `/home/cat/ros2_ws/install/...`。若指向其他工作区，当前终端
+加载的是旧安装包，不能开始本轮验收。模型文件和本地人脸库不随 Git 拉取；真实模型
+测试前还要按设备交付清单确认模型目录完整，人脸数据不得从 Git 补齐。
+
+### 0.5 启动
+
+终端 A 先启动 RealSense：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/cat/ros2_ws/install/setup.bash
+ros2 launch realsense2_camera rs_launch.py \
+  enable_color:=true enable_depth:=true align_depth.enable:=true
+```
+
+终端 B 启动视觉节点与测试页面：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/cat/ros2_ws/install/setup.bash
+ros2 launch marsdog_vision_interaction vision_debug.launch.py \
+  web_host:=0.0.0.0
+```
+
+浏览器打开 `http://<机器狗IP>:8765`。不要再同时启动
+`vision.launch.py`；否则会出现同名节点和重复 Topic。启动后继续执行
+第 3.2 节“五分钟冒烟表”，不得只以页面能打开作为通过。
 
 ## 1. 测试范围与重要边界
 
